@@ -1,8 +1,9 @@
-// api/predict.js  —  V1.5.5
-// Fix: player names always available (lineup + cross-competition /players fallback)
-// UI-friendly: provider percent (string & numeric), richer xi_players items
-// Plus: strict 1X2 odds, wide μ, XI Off/Def, H2H low-score boost, odds blend, λ cap,
-// referee & tempo factors, active-injury filter with dedupe.
+// api/predict.js  —  V1.5.6
+// New: Totals (Over/Under 2.5) market calibration for lambdas + softer DC low-score bias
+// Fix: EFL Cup (Carabao) detected as "cup" mode
+// Keep: player names (lineup + cross-competition /players fallback), provider percent (string & numeric),
+// strict 1X2 odds, wide μ, XI Off/Def, H2H low-score boost, odds blend, λ cap, referee & tempo,
+// active-injury filter with dedupe, bench-aware lineup.
 
 const API_BASE = "https://v3.football.api-sports.io";
 const KEY = process.env.APIFOOTBALL_KEY;
@@ -39,7 +40,10 @@ function poissonP(k, lambda){ return Math.exp(-lambda) * Math.pow(lambda, k) / f
 function scoreMatrix(lambdaH, lambdaA) {
   const SIZE=7; const m=Array.from({length:SIZE},()=>Array(SIZE).fill(0));
   for (let h=0; h<SIZE; h++) for (let a=0; a<SIZE; a++) m[h][a]=poissonP(h,lambdaH)*poissonP(a,lambdaA);
-  const dc=1.06; m[0][0]*=dc; m[1][0]*=dc; m[0][1]*=dc; m[1][1]*=dc;
+  // Softer Dixon–Coles: düşük toplam λ'da hafif, değilse kapalı
+  const tot = lambdaH + lambdaA;
+  const dc = tot <= 2.2 ? 1.02 : 1.00; // önce 1.06 idi → aşırı "under" eğilimini azalt
+  m[0][0]*=dc; m[1][0]*=dc; m[0][1]*=dc; m[1][1]*=dc;
   const s=m.flat().reduce((x,y)=>x+y,0); for (let h=0; h<SIZE; h++) for (let a=0; a<SIZE; a++) m[h][a]/=s;
   return m;
 }
@@ -261,6 +265,60 @@ function oddsImplied(oddsResp) {
   return { home:avg.home/n, draw:avg.draw/n, away:avg.away/n };
 }
 
+/* --------- odds -> implied Over/Under 2.5 --------- */
+function oddsImpliedTotals(oddsResp) {
+  const rs = oddsResp?.response || [];
+  const samples = [];
+  const ALLOW = /(over\/under|totals|total\s+goals)/i;
+
+  for (const fx of rs) {
+    for (const bm of (fx.bookmakers || [])) {
+      for (const bet of (bm.bets || [])) {
+        const nm = (bet.name || "").toLowerCase();
+        if (!ALLOW.test(nm)) continue;
+        // collect over/under odds for 2.5
+        let overOdd = null, underOdd = null;
+        for (const v of (bet.values || [])) {
+          const odd = Number(v.odd);
+          if (!odd || odd <= 1.01) continue;
+          const val = String(v.value || "").toLowerCase();
+          const hand = String(v.handicap || "").trim();
+          const label = hand || (val.match(/(\d+(\.\d+)?)/)?.[1] || "");
+          const is25 = label === "2.5";
+          const isOver = /^over/.test(val) || (String(v.value||"").toLowerCase() === "over");
+          const isUnder = /^under/.test(val) || (String(v.value||"").toLowerCase() === "under");
+          if (!is25) continue;
+          if (isOver) overOdd = odd;
+          if (isUnder) underOdd = odd;
+        }
+        if (overOdd && underOdd) {
+          const io = 1/overOdd, iu = 1/underOdd;
+          const den = io + iu;
+          if (den > 0) samples.push({ over25: io/den, under25: iu/den });
+        }
+      }
+    }
+  }
+  if (!samples.length) return null;
+  const avg = samples.reduce((a,b)=>({over25:a.over25+b.over25, under25:a.under25+b.under25}), {over25:0, under25:0});
+  const n = samples.length;
+  return { over25: avg.over25/n, under25: avg.under25/n };
+}
+
+// Over/Under 2.5 hedeflenerek λ'ları ortak ölçekle (bisection)
+function calibrateTotals(lambdaH, lambdaA, targetOver25) {
+  if (!(targetOver25 > 0 && targetOver25 < 1)) return { lambdaH, lambdaA, applied: false };
+  let lo = 0.6, hi = 1.6;
+  for (let i = 0; i < 16; i++) {
+    const mid = (lo + hi) / 2;
+    const m = scoreMatrix(lambdaH * mid, lambdaA * mid);
+    const over = over25(m);
+    if (over < targetOver25) lo = mid; else hi = mid;
+  }
+  const s = (lo + hi) / 2;
+  return { lambdaH: lambdaH * s, lambdaA: lambdaA * s, scale: s, applied: true };
+}
+
 /* --------- H2H düşük skor paterni --------- */
 function applyLowScoreBoost(m, h2hResp) {
   const rows = h2hResp?.response || [];
@@ -294,11 +352,16 @@ function detectModeFromFixture(fx) {
   const l = fx?.league || {};
   const name = (l.name || "").toLowerCase();
   const type = (l.type || "").toLowerCase();
-  const isUEFA = /uefa|champions league|europa league|conference league/.test(name);
-  const isNational = /(world cup|wc qualification|euro|nations league|africa cup|copa america|gold cup|asian cup)/.test(name);
+
+  const isUEFA = /(uefa|champions league|europa league|conference league)/i.test(name);
+  const isNational = /(world cup|wc qualification|euro|nations league|africa cup|copa america|gold cup|asian cup)/i.test(name);
   if (isUEFA) return "uefa";
   if (isNational) return "national";
-  if (type === "cup" && !isUEFA) return "cup";
+
+  // Geniş "cup" adı yakalama (World/continental kupaları hariç)
+  const cupName = /\b(fa cup|efl cup|carabao|league cup|dfb pokal|copa del rey|coppa italia|coupe de france|knvb beker|dutch cup|taca|taça|pokal|beker|scottish cup|copa do brasil|turkish cup|türkiye kupas[ıi])\b/i;
+  if (type === "cup" || cupName.test(name)) return "cup";
+
   return "league";
 }
 
@@ -715,8 +778,16 @@ export default async function handler(req, res){
     lambda_home *= M_ref * M_tempo_home * M_mode_home;
     lambda_away *= M_ref * M_tempo_away * M_mode_away;
 
-    lambda_home = clamp(lambda_home, 0.2, 3.8);
-    lambda_away = clamp(lambda_away, 0.2, 3.8);
+    // ---- Totals market calibration (Over/Under 2.5) ----
+    const totalsMarket = oddsImpliedTotals(oddsJs);
+    if (totalsMarket?.over25) {
+      const cal = calibrateTotals(lambda_home, lambda_away, totalsMarket.over25);
+      lambda_home = clamp(cal.lambdaH, 0.2, 3.8);
+      lambda_away = clamp(cal.lambdaA, 0.2, 3.8);
+    } else {
+      lambda_home = clamp(lambda_home, 0.2, 3.8);
+      lambda_away = clamp(lambda_away, 0.2, 3.8);
+    }
 
     let grid = scoreMatrix(lambda_home, lambda_away);
     const h2hBoost = applyLowScoreBoost(grid, h2hJs);
@@ -787,7 +858,7 @@ export default async function handler(req, res){
     }
 
     const out = {
-      version: "fa-api v1.5.5",
+      version: "fa-api v1.5.6",
       asof_utc: asof,
       input: { fixture_id: fixtureId, league_id: leagueId, season: seasonYr, mode },
       mu: { mu_home, mu_away },
@@ -855,10 +926,10 @@ export default async function handler(req, res){
         tempo: { home: tempoH, away: tempoA },
         mode_factors: { mode, M_ref, M_tempo_home, M_tempo_away },
         h2h_low_boost_applied: h2hBoost.applied,
-        market_implied: market
+        market_implied: oddsImplied(oddsJs)
       },
       explanation: {
-        notes: "V1.5.5 – İsimler garanti (lineup + cross-competition players fallback); provider percent string/numeric; bench-aware lineup; aktif sakat filtresi; hakem/tempo; geniş μ; H2H boost; odds harmanı; λ cap.",
+        notes: "V1.5.6 – Over/Under 2.5 pazarına göre λ kalibrasyonu + yumuşatılmış DC düşük-skor bias. Ayrıca EFL Cup 'cup' modu fix. İsimler garanti; provider percent; bench-aware lineup; aktif sakat filtresi; hakem/tempo; geniş μ; H2H boost; odds harmanı; λ cap.",
         flags: { low_lineup_confidence: xiConfidence!=="high", old_snapshot:false, missing_sources:false }
       },
       xi_confidence: xiConfidence,
