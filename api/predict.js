@@ -1,5 +1,5 @@
-// api/predict.js  —  V1.5.0
-// UEFA/Cup/National mode detection + Referee & Team tempo multipliers + robust provider predictions
+// api/predict.js  —  V1.5.1
+// Odds 1X2 filter tightened + Referee name sanitization + Cross-competition tempo
 
 const API_BASE = "https://v3.football.api-sports.io";
 const KEY = process.env.APIFOOTBALL_KEY;
@@ -36,7 +36,6 @@ function poissonP(k, lambda){ return Math.exp(-lambda) * Math.pow(lambda, k) / f
 function scoreMatrix(lambdaH, lambdaA) {
   const SIZE=7; const m=Array.from({length:SIZE},()=>Array(SIZE).fill(0));
   for (let h=0; h<SIZE; h++) for (let a=0; a<SIZE; a++) m[h][a]=poissonP(h,lambdaH)*poissonP(a,lambdaA);
-  // hafif DC:
   const dc=1.06; m[0][0]*=dc; m[1][0]*=dc; m[0][1]*=dc; m[1][1]*=dc;
   const s=m.flat().reduce((x,y)=>x+y,0); for (let h=0; h<SIZE; h++) for (let a=0; a<SIZE; a++) m[h][a]/=s;
   return m;
@@ -167,27 +166,29 @@ function teamFromXI(playerRatingsById, xiIds) {
   };
 }
 
-/* --------- odds -> implied 1X2 --------- */
+/* --------- odds -> implied 1X2 (strict) --------- */
 function oddsImplied(oddsResp) {
   const rs = oddsResp?.response || [];
   const triplets = [];
+  const ALLOW = /(^|\s)(full\s*time\s*result|match\s*winner|1x2)(\s|$)/i;
+  const BLOCK = /(to\s*qualify|double\s*chance|draw\s*no\s*bet|handicap|asian|1st|2nd|first\s*half|second\s*half|overtime|extra\s*time|penalt)/i;
+
   for (const fx of rs) {
     for (const bm of (fx.bookmakers||[])) {
       for (const bet of (bm.bets||[])) {
         const name = (bet.name||"").toLowerCase();
-        if (name.includes("match") || name.includes("1x2") || name.includes("winner")) {
-          let h=null,d=null,a=null;
-          for (const v of (bet.values||[])) {
-            const nm=(v.value||"").toLowerCase();
-            const odd=Number(v.odd);
-            if (!odd || odd<=1.01) continue;
-            if (nm.includes("home") || nm==="1") h = 1/odd;
-            else if (nm.includes("draw") || nm==="x") d = 1/odd;
-            else if (nm.includes("away") || nm==="2") a = 1/odd;
-          }
-          if (h && d && a) {
-            const s=h+d+a; triplets.push({home:h/s, draw:d/s, away:a/s});
-          }
+        if (!ALLOW.test(name) || BLOCK.test(name)) continue;
+        let h=null,d=null,a=null;
+        for (const v of (bet.values||[])) {
+          const nm=(v.value||"").toLowerCase().trim();
+          const odd=Number(v.odd);
+          if (!odd || odd<=1.01) continue;
+          if (nm==="1" || nm.includes("home")) h = 1/odd;
+          else if (nm==="x" || nm.includes("draw")) d = 1/odd;
+          else if (nm==="2" || nm.includes("away")) a = 1/odd;
+        }
+        if (h && d && a) {
+          const s=h+d+a; triplets.push({home:h/s, draw:d/s, away:a/s});
         }
       }
     }
@@ -231,7 +232,7 @@ function applyLowScoreBoost(m, h2hResp) {
 function detectModeFromFixture(fx) {
   const l = fx?.league || {};
   const name = (l.name || "").toLowerCase();
-  const type = (l.type || "").toLowerCase(); // "League" | "Cup"
+  const type = (l.type || "").toLowerCase();
   const isUEFA = /uefa|champions league|europa league|conference league/.test(name);
   const isNational = /(world cup|wc qualification|euro|nations league|africa cup|copa america|gold cup|asian cup)/.test(name);
   if (isUEFA) return "uefa";
@@ -241,38 +242,59 @@ function detectModeFromFixture(fx) {
 }
 
 /* --------- Referee & tempo factors --------- */
-async function refereeFactors(fixture) {
-  const refName = fixture?.fixture?.referee;
-  if (!refName) return { has:false, name:null, matches:0, yc:0, rc:0, fouls:0, tempo_mult:1.0 };
-  // Not: API-FOOTBALL 'referee' filtresi bazı liglerde sınırlı olabilir; boş dönerse nötr.
-  const refGames = await afGetAll("/fixtures", { referee: refName, last: 20 });
-  let n=0, yc=0, rc=0, fouls=0;
+function sanitizeRefName(ref) {
+  if (!ref) return null;
+  let s = String(ref);
+  s = s.replace(/\(.*?\)/g, "");  // parantez içi
+  s = s.split(",")[0];            // ülkeyi at
+  s = s.replace(/\s+/g, " ").trim();
+  return s || null;
+}
+function lastName(ref) {
+  if (!ref) return null;
+  const parts = ref.trim().split(/\s+/);
+  return parts.length ? parts[parts.length-1] : ref;
+}
 
-  for (const g of refGames) {
+async function refereeFactors(fixture) {
+  const refRaw = fixture?.fixture?.referee;
+  const candidates = [];
+  const a = sanitizeRefName(refRaw);
+  if (a) candidates.push(a);
+  const ln = lastName(a);
+  if (ln && ln !== a) candidates.push(ln);
+
+  let collected = [];
+  for (const q of candidates) {
+    try {
+      const got = await afGetAll("/fixtures", { referee: q, last: 20 });
+      collected.push(...got);
+    } catch(_) {}
+  }
+  // uniq by fixture id
+  const seen = new Set(); collected = collected.filter(x => {
+    const id = x?.fixture?.id; if (!id || seen.has(id)) return false; seen.add(id); return true;
+  });
+
+  let n=0, yc=0, rc=0, fouls=0;
+  for (const g of collected) {
     const st = (g?.fixture?.status?.short || "").toUpperCase();
     if (st !== "FT") continue;
-    n++;
-
     const fid = g?.fixture?.id;
     if (!fid) continue;
-
-    // events -> kartlar
+    n++;
     try {
       const evJs = await afGet("/fixtures/events", { fixture: fid });
-      const events = evJs?.response || [];
-      for (const e of events) {
+      for (const e of (evJs?.response||[])) {
         const t = (e?.type || "").toLowerCase();
         const d = (e?.detail || "").toLowerCase();
         if (t === "card" && d.includes("yellow")) yc++;
         if (t === "card" && d.includes("red")) rc++;
       }
     } catch(_) {}
-
-    // statistics -> fouls
     try {
       const stxJs = await afGet("/fixtures/statistics", { fixture: fid });
-      const teamsStats = stxJs?.response || [];
-      for (const ts of teamsStats) {
+      for (const ts of (stxJs?.response||[])) {
         const arr = ts?.statistics || [];
         const foulsRow = arr.find(r => (r?.type || "").toLowerCase() === "fouls");
         fouls += Number(foulsRow?.value || 0);
@@ -280,22 +302,20 @@ async function refereeFactors(fixture) {
     } catch(_) {}
   }
 
-  if (n === 0) return { has:false, name:refName, matches:0, yc:0, rc:0, fouls:0, tempo_mult:1.0 };
+  if (n === 0) return { has:false, name:refRaw || null, matches:0, yc:0, rc:0, fouls:0, tempo_mult:1.0 };
 
   const ycPer = yc / n, rcPer = rc / n, foulsPer = fouls / n;
-
-  // Basit tempo modeli (kart/foul yüksek => tempo azıcık düşer)
   let tempo = 1.0;
   if (ycPer > 4.5) tempo -= 0.02;
   if (ycPer > 5.5) tempo -= 0.01;
   if (foulsPer > 26) tempo -= 0.02;
   tempo = clamp(tempo, 0.92, 1.02);
 
-  return { has:true, name:refName, matches:n, yc:Number(ycPer.toFixed(2)), rc:Number(rcPer.toFixed(2)), fouls:Number(foulsPer.toFixed(1)), tempo_mult:Number(tempo.toFixed(3)) };
+  return { has:true, name:refRaw || null, matches:n, yc:Number(ycPer.toFixed(2)), rc:Number(rcPer.toFixed(2)), fouls:Number(foulsPer.toFixed(1)), tempo_mult:Number(tempo.toFixed(3)) };
 }
 
-async function teamTempoIndex(teamId, season) {
-  const last = await afGetAll("/fixtures", { team: teamId, season, last: 6 });
+async function teamTempoIndex(teamId /* no season filter: cross-competition */) {
+  const last = await afGetAll("/fixtures", { team: teamId, last: 6 });
   let n=0, shots=0, poss=0, dang=0;
 
   for (const g of last) {
@@ -305,8 +325,7 @@ async function teamTempoIndex(teamId, season) {
     if (!fxId) continue;
     try {
       const stx = await afGet("/fixtures/statistics", { fixture: fxId });
-      const rows = stx?.response || [];
-      for (const r of rows) {
+      for (const r of (stx?.response || [])) {
         const arr = r?.statistics || [];
         const getVal = (key) => {
           const row = arr.find(z => (z?.type || "").toLowerCase() === key);
@@ -327,7 +346,6 @@ async function teamTempoIndex(teamId, season) {
   const possAvg  = poss / n;
   const dangAvg  = dang / n;
 
-  // Basit lig-agnostik referanslar
   let tempo = 1.0;
   if (shotsAvg > 26) tempo += 0.03;
   if (shotsAvg < 18) tempo -= 0.02;
@@ -349,7 +367,7 @@ async function computeLeagueMu(leagueId, season) {
   for (const f of fixtures) {
     const st = (f?.fixture?.status?.short||"").toUpperCase();
     const dISO = f?.fixture?.date;
-    if (!dISO || new Date(dISO).toISOString() >= nowISO) continue; // as-of
+    if (!dISO || new Date(dISO).toISOString() >= nowISO) continue;
     if (st!=="FT") continue;
     const gh = f?.goals?.home ?? f?.score?.fulltime?.home ?? 0;
     const ga = f?.goals?.away ?? f?.score?.fulltime?.away ?? 0;
@@ -403,7 +421,6 @@ export default async function handler(req, res){
 
     const mode = detectModeFromFixture(fixture);
 
-    // bulk fetch
     const [
       homeStatsJs, awayStatsJs,
       injHomeJs, injAwayJs,
@@ -423,11 +440,9 @@ export default async function handler(req, res){
       teamPlayersRatings(awayId, leagueId, seasonYr)
     ]);
 
-    // μ (lig tabanı as-of)
     const { mu_home, mu_away } = await computeLeagueMu(leagueId, seasonYr);
     const mu_team = (mu_home+mu_away)/2;
 
-    // takım üstü avg (fallback)
     const hs = homeStatsJs?.response || {};
     const as = awayStatsJs?.response || {};
     const gfH = Number(hs?.goals?.for?.average?.total ?? 1.3);
@@ -435,7 +450,6 @@ export default async function handler(req, res){
     const gfA = Number(as?.goals?.for?.average?.total ?? 1.3);
     const gaA = Number(as?.goals?.against?.average?.total ?? 1.3);
 
-    // XI ve ideal XI
     const lineups = lineupsJs?.response || [];
     const xiHomeIds = lineupIds(lineups.find(x=>x?.team?.id===homeId)) || [];
     const xiAwayIds = lineupIds(lineups.find(x=>x?.team?.id===awayId)) || [];
@@ -452,7 +466,6 @@ export default async function handler(req, res){
     const idealH = teamFromXI(homePR, idealHome);
     const idealA = teamFromXI(awayPR, idealAway);
 
-    // sakat/ceza (list)
     const injHome = injHomeJs?.response || [];
     const injAway = injAwayJs?.response || [];
     const injIdsHome = new Set(injHome.map(x=>x?.player?.id).filter(Boolean));
@@ -460,7 +473,6 @@ export default async function handler(req, res){
     const keyOutHome = idealHome.filter(id => !currentHome.includes(id) && injIdsHome.has(id));
     const keyOutAway = idealAway.filter(id => !currentAway.includes(id) && injIdsAway.has(id));
 
-    // takım-üstü + XI harmanı
     const clampOD = (x)=> clamp(x, 20, 180);
     const offH_stats = clampOD((gfH/mu_team)*100);
     const defH_stats = clampOD((mu_team/gaH)*100);
@@ -477,42 +489,34 @@ export default async function handler(req, res){
     const OffA = 0.6*offA_xi + 0.4*offA_stats;
     const DefA = 0.6*defA_xi + 0.4*defA_stats;
 
-    // SoS (hafif, endpoint'te form alanı sınırlı olabilir -> nötrlenir)
     const sosHomeOff = clamp((toNum(hs?.form?.att?.value)||1), 0.8, 1.2);
     const sosHomeDef = clamp((toNum(hs?.form?.def?.value)||1), 0.8, 1.2);
     const sosAwayOff = clamp((toNum(as?.form?.att?.value)||1), 0.8, 1.2);
     const sosAwayDef = clamp((toNum(as?.form?.def?.value)||1), 0.8, 1.2);
 
-    // başlangıç λ
     let lambda_home = mu_home * (OffH/100) * (100/DefA) * sosHomeOff * (1/sosAwayDef);
     let lambda_away = mu_away * (OffA/100) * (100/DefH) * sosAwayOff * (1/sosHomeDef);
 
-    // XI belirsizliği
     if (xiConfidence === "medium") { lambda_home*=0.97; lambda_away*=0.97; }
     if (xiConfidence === "low")    { lambda_home*=0.94; lambda_away*=0.94; }
 
-    // --- Referee & Team tempo multipliers ---
     const [refFx, tempoH, tempoA] = await Promise.all([
       refereeFactors(fixture),
-      teamTempoIndex(homeId, seasonYr),
-      teamTempoIndex(awayId, seasonYr),
+      teamTempoIndex(homeId),
+      teamTempoIndex(awayId),
     ]);
+
     const M_ref = refFx?.tempo_mult ?? 1.0;
     const M_tempo_home = tempoH?.tempo_mult ?? 1.0;
     const M_tempo_away = tempoA?.tempo_mult ?? 1.0;
 
-    // --- Mode multipliers (şimdilik nötr; odds harmanı zaten rekabet gücünü taşır) ---
-    let M_mode_home = 1.0, M_mode_away = 1.0;
-    // if (mode === "cup") { /* ileride cross-tier/rotasyon için küçük düzeltme */ }
-
+    let M_mode_home = 1.0, M_mode_away = 1.0; // hook: ileride cup/uefa spesifik düzeltme
     lambda_home *= M_ref * M_tempo_home * M_mode_home;
     lambda_away *= M_ref * M_tempo_away * M_mode_away;
 
-    // güvenli sınırlar
     lambda_home = clamp(lambda_home, 0.2, 3.8);
     lambda_away = clamp(lambda_away, 0.2, 3.8);
 
-    // skor ızgarası + H2H düşük skor düzeltmesi
     let grid = scoreMatrix(lambda_home, lambda_away);
     const h2hBoost = applyLowScoreBoost(grid, h2hJs);
     grid = h2hBoost.matrix;
@@ -522,7 +526,6 @@ export default async function handler(req, res){
     const over = over25(grid);
     const under = 1 - over;
 
-    // piyasa harmanı (1X2)
     const market = oddsImplied(oddsJs);
     const blend = (m,b,alpha=0.75)=> {
       if (!b) return m;
@@ -546,10 +549,12 @@ export default async function handler(req, res){
       else if (item.data?.predictions) p = Array.isArray(item.data.predictions) ? item.data.predictions[0] : item.data.predictions;
 
       const percent = p?.percent || item?.percent || null;
-      const toP = s => (typeof s==="string" ? Number(s.replace("%",""))/100
+      const toP = s => (typeof s==="string" ? Number(String(s).replace("%",""))/100
                         : (typeof s==="number" ? s : null));
       let probs_1x2 = null;
-      if (percent && (percent.home ?? percent.Home) != null) {
+      if (percent && (percent.home ?? percent.Home) != null &&
+          (percent.draw ?? percent.Draw) != null &&
+          (percent.away ?? percent.Away) != null) {
         probs_1x2 = {
           home: toP(percent.home ?? percent.Home),
           draw: toP(percent.draw ?? percent.Draw),
@@ -568,7 +573,6 @@ export default async function handler(req, res){
       };
     }
 
-    // injuries counts
     const injHomeCount = (injHomeJs?.response||[]).length;
     const injAwayCount = (injAwayJs?.response||[]).length;
 
@@ -578,7 +582,7 @@ export default async function handler(req, res){
     });
 
     const out = {
-      version: "fa-api v1.5.0",
+      version: "fa-api v1.5.1",
       asof_utc: asof,
       input: { fixture_id: fixtureId, league_id: leagueId, season: seasonYr, mode },
       mu: { mu_home, mu_away },
@@ -630,7 +634,7 @@ export default async function handler(req, res){
         market_implied: oddsImplied(oddsJs)
       },
       explanation: {
-        notes: "V1.5.0 – UEFA/Kupa/Milli mod tespiti, hakem & tempo çarpanları, robust provider parser; lig μ geniş pencere; oyuncu-bazlı Off/Def + H2H düşük-skor boost; odds harmanı; λ cap.",
+        notes: "V1.5.1 – 1X2 pazar filtresi sıkılaştırıldı; hakem adı sanitize edilip çoklu arama denemeleri; tempo endeksi lig dışı maçları da kapsıyor. Diğer: μ geniş pencere, oyuncu-bazlı Off/Def, H2H düşük-skor boost, odds harmanı, λ cap.",
         flags: { low_lineup_confidence: xiConfidence!=="high", old_snapshot:false, missing_sources:false }
       },
       xi_confidence: xiConfidence,
