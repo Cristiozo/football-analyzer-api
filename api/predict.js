@@ -1,6 +1,7 @@
-// api/predict.js  —  V1.5.2
-// Referee global fallback scan + Expanded tempo keys + Robust provider parser
-// Odds 1X2 strict filter, league μ wide window, XI-based Off/Def, H2H low-score boost, odds blend, λ cap.
+// api/predict.js  —  V1.5.3
+// Fix: realistic "missing players" — active injury filter + bench-aware lineup
+// Also keeps: referee global fallback, expanded tempo keys, strict 1X2 odds, wide μ window,
+// XI-based Off/Def, H2H low-score boost, odds blend, λ cap.
 
 const API_BASE = "https://v3.football.api-sports.io";
 const KEY = process.env.APIFOOTBALL_KEY;
@@ -141,9 +142,52 @@ function weightForTeam(pos) {
   if (pos==="DEF") return { off:0.30, def:0.90 };
   return { off:0.50, def:0.50 };
 }
+
+/* --------- injuries: dedupe + "active" filter --------- */
+const INJ_ACTIVE_WINDOW_DAYS = Number(process.env.INJ_ACTIVE_WINDOW_DAYS || 35);
+const INJ_INCLUDE_DOUBTFUL = String(process.env.INJ_INCLUDE_DOUBTFUL || "0") === "1";
+
+function dedupeInjuriesByPlayer(arr){
+  const seen = new Set(); const out = [];
+  for (const r of (arr||[])) {
+    const pid = r?.player?.id || r?.id;
+    if (!pid || seen.has(pid)) continue;
+    seen.add(pid); out.push(r);
+  }
+  return out;
+}
+function isDoubtfulOrMinor(reason){
+  if (!reason) return false;
+  const s = String(reason).toLowerCase();
+  return /(doubt|minor|knock|rest|rotation|fatigue|cold|illness\?) /.test(s) || /doubtful/.test(s);
+}
+function looksRecovered(reason){
+  if (!reason) return false;
+  const s = String(reason).toLowerCase();
+  return /(return|returned|back in training|fit|recovered)/.test(s);
+}
+function injuryIsActive(rec, nowMs=Date.now()){
+  const reason = rec?.reason || rec?.type || rec?.player?.reason || "";
+  if (!INJ_INCLUDE_DOUBTFUL && isDoubtfulOrMinor(reason)) return false;
+  if (looksRecovered(reason)) return false;
+  // timestamp fallback chain
+  let ts = rec?.fixture?.timestamp ? rec.fixture.timestamp*1000 : null;
+  ts = ts ?? (rec?.timestamp ? rec.timestamp*1000 : null);
+  if (!ts) {
+    const d = rec?.date || rec?.start || rec?.update;
+    const t = d ? Date.parse(d) : NaN;
+    ts = Number.isFinite(t) ? t : Date.now();
+  }
+  const maxAge = INJ_ACTIVE_WINDOW_DAYS*24*3600*1000;
+  return (nowMs - ts) <= maxAge;
+}
+
+/* --------- lineup helpers (bench-aware) --------- */
 function lineupIds(lineupObj) {
-  const arr = lineupObj?.startXI || [];
-  return arr.map(x => x?.player?.id).filter(Boolean);
+  const starters = lineupObj?.startXI || [];
+  const bench = lineupObj?.substitutes || [];
+  const all = [...starters, ...bench];
+  return all.map(x => x?.player?.id).filter(Boolean);
 }
 function teamFromXI(playerRatingsById, xiIds) {
   let offSum=0, offW=0, defSum=0, defW=0;
@@ -248,7 +292,7 @@ function asNumber(v){
   if (typeof v === "string" && v.trim().endsWith("%")) return Number(v.replace("%","")) || 0;
   return Number(v) || 0;
 }
-function getStatValue(rows, keys /* array of lowercased keys */, fallbackPairs=[]){
+function getStatValue(rows, keys, fallbackPairs=[]){
   const find = (k) => rows.find(r => (r?.type || "").toLowerCase() === k);
   for (const k of keys){
     const hit = find(k);
@@ -265,8 +309,8 @@ function getStatValue(rows, keys /* array of lowercased keys */, fallbackPairs=[
 function sanitizeRefName(ref) {
   if (!ref) return null;
   let s = String(ref);
-  s = s.replace(/\(.*?\)/g, "");  // parantez içi
-  s = s.split(",")[0];            // ülkeyi at
+  s = s.replace(/\(.*?\)/g, "");
+  s = s.split(",")[0];
   s = s.replace(/\s+/g, " ").trim();
   return s || null;
 }
@@ -283,7 +327,6 @@ function nameVariants(full){
   ].filter(Boolean));
   return Array.from(variants);
 }
-
 const REF_FALLBACK_SCAN_DAYS   = Number(process.env.REF_FALLBACK_SCAN_DAYS || 365);
 const REF_FALLBACK_MAX_MATCHES = Number(process.env.REF_FALLBACK_MAX_MATCHES || 60);
 const REF_FALLBACK_MAX_PAGES   = Number(process.env.REF_FALLBACK_MAX_PAGES || 12);
@@ -321,7 +364,6 @@ async function refereeFactors(fixture) {
   const clean = sanitizeRefName(refRaw);
   const variants = nameVariants(clean);
 
-  // 1) Doğrudan referee araması
   let collected = [];
   for (const q of variants) {
     try {
@@ -329,11 +371,9 @@ async function refereeFactors(fixture) {
       collected.push(...got);
     } catch(_) {}
   }
-  // uniq
   const seen = new Set();
   collected = collected.filter(x => { const id = x?.fixture?.id; if (!id || seen.has(id)) return false; seen.add(id); return true; });
 
-  // 2) fallback: soyadla global tarama
   if (!collected.length && variants.length){
     try {
       const ln = variants.find(v => v.split(/\s+/).length === 1) || variants[0];
@@ -342,7 +382,6 @@ async function refereeFactors(fixture) {
     } catch(_) {}
   }
 
-  // 3) Event + statistics ile metrik
   let n=0, yc=0, rc=0, fouls=0;
   for (const g of collected) {
     const st = (g?.fixture?.status?.short || "").toUpperCase();
@@ -389,8 +428,7 @@ async function refereeFactors(fixture) {
   };
 }
 
-async function teamTempoIndex(teamId /* cross-competition */) {
-  // 10 maça kadar bak, lig/turnuva ayrımı yok
+async function teamTempoIndex(teamId) {
   const last = await afGetAll("/fixtures", { team: teamId, last: 10 });
   let m=0;
   let shotsSum=0, attacksSum=0, dangSum=0, possSum=0;
@@ -420,7 +458,7 @@ async function teamTempoIndex(teamId /* cross-competition */) {
         shotsBoth   += shots;
         attacksBoth += attacks;
         dangBoth    += dang;
-        possBoth    += poss; // yüzdelik; iki takım toplamı ~100
+        possBoth    += poss;
         teams++;
       }
       if (teams > 0){
@@ -443,13 +481,10 @@ async function teamTempoIndex(teamId /* cross-competition */) {
   let tempo = 1.0;
   if (shotsAvg > 28) tempo += 0.03;
   if (shotsAvg < 18) tempo -= 0.02;
-
   if (attacksAvg > 200) tempo += 0.02;
   if (attacksAvg < 140) tempo -= 0.01;
-
   if (dangAvg > 120) tempo += 0.02;
   if (dangAvg < 75)  tempo -= 0.01;
-
   if (possAvg > 56) tempo += 0.005;
   if (possAvg < 44) tempo -= 0.005;
 
@@ -561,12 +596,14 @@ export default async function handler(req, res){
     const gfA = Number(as?.goals?.for?.average?.total ?? 1.3);
     const gaA = Number(as?.goals?.against?.average?.total ?? 1.3);
 
+    // lineups (bench-aware)
     const lineups = lineupsJs?.response || [];
     const xiHomeIds = lineupIds(lineups.find(x=>x?.team?.id===homeId)) || [];
     const xiAwayIds = lineupIds(lineups.find(x=>x?.team?.id===awayId)) || [];
     const xiAvailable = (xiHomeIds.length>0 && xiAwayIds.length>0 && kickoff>now);
     const xiConfidence = xiAvailable ? "high" : (kickoff - now < 90*60*1000 ? "medium" : "low");
 
+    // ideal vs current
     const idealHome = idealXIFromRatings(homePR);
     const idealAway = idealXIFromRatings(awayPR);
     const currentHome = xiHomeIds.length ? xiHomeIds : idealHome;
@@ -577,12 +614,23 @@ export default async function handler(req, res){
     const idealH = teamFromXI(homePR, idealHome);
     const idealA = teamFromXI(awayPR, idealAway);
 
-    const injHome = injHomeJs?.response || [];
-    const injAway = injAwayJs?.response || [];
-    const injIdsHome = new Set(injHome.map(x=>x?.player?.id).filter(Boolean));
-    const injIdsAway = new Set(injAway.map(x=>x?.player?.id).filter(Boolean));
-    const keyOutHome = idealHome.filter(id => !currentHome.includes(id) && injIdsHome.has(id));
-    const keyOutAway = idealAway.filter(id => !currentAway.includes(id) && injIdsAway.has(id));
+    // injuries -> dedupe + active window
+    const injHomeAll = dedupeInjuriesByPlayer(injHomeJs?.response || []);
+    const injAwayAll = dedupeInjuriesByPlayer(injAwayJs?.response || []);
+    const injHomeActive = injHomeAll.filter(r => injuryIsActive(r));
+    const injAwayActive = injAwayAll.filter(r => injuryIsActive(r));
+
+    const injIdsHome = new Set(injHomeActive.map(x=>x?.player?.id).filter(Boolean));
+    const injIdsAway = new Set(injAwayActive.map(x=>x?.player?.id).filter(Boolean));
+
+    // only count as "confirmed_out" if: ideal XI oyuncusu + maç günü kadrosunda yok + aktif sakat listesinde
+    const idealSetHome = new Set(idealHome);
+    const idealSetAway = new Set(idealAway);
+    const squadSetHome = new Set(currentHome); // includes bench
+    const squadSetAway = new Set(currentAway);
+
+    const keyOutHome = idealHome.filter(id => !squadSetHome.has(id) && injIdsHome.has(id));
+    const keyOutAway = idealAway.filter(id => !squadSetAway.has(id) && injIdsAway.has(id));
 
     const clampOD = (x)=> clamp(x, 20, 180);
     const offH_stats = clampOD((gfH/mu_team)*100);
@@ -621,7 +669,7 @@ export default async function handler(req, res){
     const M_tempo_home = tempoH?.tempo_mult ?? 1.0;
     const M_tempo_away = tempoA?.tempo_mult ?? 1.0;
 
-    let M_mode_home = 1.0, M_mode_away = 1.0; // hook: ileride cup/uefa spesifik düzeltme
+    let M_mode_home = 1.0, M_mode_away = 1.0; // future hooks for UEFA/cup
     lambda_home *= M_ref * M_tempo_home * M_mode_home;
     lambda_away *= M_ref * M_tempo_away * M_mode_away;
 
@@ -648,7 +696,7 @@ export default async function handler(req, res){
     };
     const win_blended = blend(win, market);
 
-    // provider predictions (sağlam ayrıştırıcı)
+    // provider predictions (robust)
     let provider = null;
     const r = providerPredJs?.response;
     if (Array.isArray(r) && r.length) {
@@ -684,16 +732,13 @@ export default async function handler(req, res){
       };
     }
 
-    const injHomeCount = (injHomeJs?.response||[]).length;
-    const injAwayCount = (injAwayJs?.response||[]).length;
-
     const pickLite = (ids, map) => ids.map(id => {
       const r = map.get(id);
       return r ? { id, grp: r.pos, off: Math.round(r.off), def: Math.round(r.def) } : { id };
     });
 
     const out = {
-      version: "fa-api v1.5.2",
+      version: "fa-api v1.5.3",
       asof_utc: asof,
       input: { fixture_id: fixtureId, league_id: leagueId, season: seasonYr, mode },
       mu: { mu_home, mu_away },
@@ -734,18 +779,30 @@ export default async function handler(req, res){
           }
         },
         xi_players: {
-          home: { idealXI: pickLite(idealHome, homePR), currentXI: pickLite(currentHome, homePR), key_out: keyOutHome },
-          away: { idealXI: pickLite(idealAway, awayPR), currentXI: pickLite(currentAway, awayPR), key_out: keyOutAway }
+          home: { idealXI: pickLite(idealHome, homePR), currentXI: pickLite(currentHome, homePR) },
+          away: { idealXI: pickLite(idealAway, awayPR), currentXI: pickLite(currentAway, awayPR) }
         },
-        injuries: { home_count: injHomeCount, away_count: injAwayCount },
-        referee: refFx,
-        tempo: { home: tempoH, away: tempoA },
-        mode_factors: { mode, M_ref, M_tempo_home, M_tempo_away },
+        // absences: consumer should use "confirmed_out" as "eksik"
+        absences: {
+          home: {
+            confirmed_out: keyOutHome.length,
+            active_injuries: injHomeActive.length,
+            listed_injuries_total: injHomeAll.length
+          },
+          away: {
+            confirmed_out: keyOutAway.length,
+            active_injuries: injAwayActive.length,
+            listed_injuries_total: injAwayAll.length
+          }
+        },
+        referee: await refereeFactors(fixture),
+        tempo: { home: await teamTempoIndex(homeId), away: await teamTempoIndex(awayId) }, // kept here for completeness
+        mode_factors: { mode },
         h2h_low_boost_applied: h2hBoost.applied,
         market_implied: market
       },
       explanation: {
-        notes: "V1.5.2 – Hakem global fallback (soyadla tarama) + tempo için geniş istatistik anahtarları. Diğerleri: μ geniş pencere, XI-bazlı Off/Def, H2H düşük-skor boost, odds harmanı, λ cap, katı 1X2 pazar filtresi.",
+        notes: "V1.5.3 – Eksik oyuncu sayımı düzeltildi: (startXI+bench) kadro bilinci + aktif sakat deduplikasyonu ve zaman penceresi. UI 'eksik' için absences.home.confirmed_out kullanmalı.",
         flags: { low_lineup_confidence: xiConfidence!=="high", old_snapshot:false, missing_sources:false }
       },
       xi_confidence: xiConfidence,
@@ -769,9 +826,10 @@ export default async function handler(req, res){
     };
 
     if (debug) {
-      out.modifiers.provider_raw_excerpt = JSON.stringify(
-        (providerPredJs?.response||[])[0] ?? null
-      ).slice(0, 1200);
+      out.modifiers._debug = {
+        INJ_ACTIVE_WINDOW_DAYS,
+        INJ_INCLUDE_DOUBTFUL,
+      };
     }
 
     return res.status(200).json(out);
