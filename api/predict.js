@@ -1,7 +1,7 @@
-// api/predict.js  —  V1.5.3
-// Fix: realistic "missing players" — active injury filter + bench-aware lineup
-// Also keeps: referee global fallback, expanded tempo keys, strict 1X2 odds, wide μ window,
-// XI-based Off/Def, H2H low-score boost, odds blend, λ cap.
+// api/predict.js  —  V1.5.4
+// Provider predictions: percent (string) + percent_num (numeric) for UI compatibility
+// Also: bench-aware lineup, active-injury dedupe, strict 1X2 odds, wide μ window,
+// XI-based Off/Def, H2H low-score boost, odds blend, λ cap, referee/tempo factors.
 
 const API_BASE = "https://v3.football.api-sports.io";
 const KEY = process.env.APIFOOTBALL_KEY;
@@ -159,7 +159,7 @@ function dedupeInjuriesByPlayer(arr){
 function isDoubtfulOrMinor(reason){
   if (!reason) return false;
   const s = String(reason).toLowerCase();
-  return /(doubt|minor|knock|rest|rotation|fatigue|cold|illness\?) /.test(s) || /doubtful/.test(s);
+  return /(doubt|minor|knock|rest|rotation|fatigue|cold|illness\?)/.test(s) || /doubtful/.test(s);
 }
 function looksRecovered(reason){
   if (!reason) return false;
@@ -170,7 +170,6 @@ function injuryIsActive(rec, nowMs=Date.now()){
   const reason = rec?.reason || rec?.type || rec?.player?.reason || "";
   if (!INJ_INCLUDE_DOUBTFUL && isDoubtfulOrMinor(reason)) return false;
   if (looksRecovered(reason)) return false;
-  // timestamp fallback chain
   let ts = rec?.fixture?.timestamp ? rec.fixture.timestamp*1000 : null;
   ts = ts ?? (rec?.timestamp ? rec.timestamp*1000 : null);
   if (!ts) {
@@ -466,7 +465,7 @@ async function teamTempoIndex(teamId) {
         shotsSum   += shotsBoth;
         attacksSum += attacksBoth;
         dangSum    += dangBoth;
-        possSum    += (possBoth/teams); // ~50 civarı
+        possSum    += (possBoth/teams);
       }
     } catch(_) {}
   }
@@ -623,12 +622,9 @@ export default async function handler(req, res){
     const injIdsHome = new Set(injHomeActive.map(x=>x?.player?.id).filter(Boolean));
     const injIdsAway = new Set(injAwayActive.map(x=>x?.player?.id).filter(Boolean));
 
-    // only count as "confirmed_out" if: ideal XI oyuncusu + maç günü kadrosunda yok + aktif sakat listesinde
-    const idealSetHome = new Set(idealHome);
-    const idealSetAway = new Set(idealAway);
-    const squadSetHome = new Set(currentHome); // includes bench
+    // confirmed_out = ideal XI oyuncusu + maç günü kadrosunda yok + aktif sakat listesinde
+    const squadSetHome = new Set(currentHome);
     const squadSetAway = new Set(currentAway);
-
     const keyOutHome = idealHome.filter(id => !squadSetHome.has(id) && injIdsHome.has(id));
     const keyOutAway = idealAway.filter(id => !squadSetAway.has(id) && injIdsAway.has(id));
 
@@ -659,6 +655,7 @@ export default async function handler(req, res){
     if (xiConfidence === "medium") { lambda_home*=0.97; lambda_away*=0.97; }
     if (xiConfidence === "low")    { lambda_home*=0.94; lambda_away*=0.94; }
 
+    // Referee & tempo (reused later, no duplicate calls)
     const [refFx, tempoH, tempoA] = await Promise.all([
       refereeFactors(fixture),
       teamTempoIndex(homeId),
@@ -669,7 +666,7 @@ export default async function handler(req, res){
     const M_tempo_home = tempoH?.tempo_mult ?? 1.0;
     const M_tempo_away = tempoA?.tempo_mult ?? 1.0;
 
-    let M_mode_home = 1.0, M_mode_away = 1.0; // future hooks for UEFA/cup
+    let M_mode_home = 1.0, M_mode_away = 1.0; // hooks for future UEFA/cup specifics
     lambda_home *= M_ref * M_tempo_home * M_mode_home;
     lambda_away *= M_ref * M_tempo_away * M_mode_away;
 
@@ -696,7 +693,8 @@ export default async function handler(req, res){
     };
     const win_blended = blend(win, market);
 
-    // provider predictions (robust)
+    // -------- Provider predictions (robust + UI-compatible fields) --------
+    const fmtPct = (x) => `${Math.round((Number(x)||0)*100)}%`;
     let provider = null;
     const r = providerPredJs?.response;
     if (Array.isArray(r) && r.length) {
@@ -707,27 +705,41 @@ export default async function handler(req, res){
       else if (item.prediction && typeof item.prediction === "object") p = item.prediction;
       else if (item.data?.predictions) p = Array.isArray(item.data.predictions) ? item.data.predictions[0] : item.data.predictions;
 
-      const percent = p?.percent || item?.percent || null;
-      const toP = s => (typeof s==="string" ? Number(String(s).replace("%",""))/100
-                        : (typeof s==="number" ? s : null));
-      let probs_1x2 = null;
-      if (percent && (percent.home ?? percent.Home) != null &&
-          (percent.draw ?? percent.Draw) != null &&
-          (percent.away ?? percent.Away) != null) {
-        probs_1x2 = {
-          home: toP(percent.home ?? percent.Home),
-          draw: toP(percent.draw ?? percent.Draw),
-          away: toP(percent.away ?? percent.Away)
-        };
-      }
+      const rawPercent = p?.percent || item?.percent || null;
+      const toP = s => {
+        if (s == null) return null;
+        if (typeof s === "number") return (s > 1 ? s/100 : s);
+        const num = Number(String(s).replace("%",""));
+        return Number.isFinite(num) ? (num > 1 ? num/100 : num) : null;
+      };
+      const pn = {
+        home: toP(rawPercent?.home ?? rawPercent?.Home),
+        draw: toP(rawPercent?.draw ?? rawPercent?.Draw),
+        away: toP(rawPercent?.away ?? rawPercent?.Away)
+      };
+      const probs_1x2 = (pn.home!=null && pn.draw!=null && pn.away!=null) ? pn : null;
+
+      // Build both numeric & string percent for frontends
+      const percent_num = probs_1x2 ? {
+        home: Number(probs_1x2.home.toFixed(3)),
+        draw: Number(probs_1x2.draw.toFixed(3)),
+        away: Number(probs_1x2.away.toFixed(3)),
+      } : null;
+      const percent = probs_1x2 ? {
+        home: fmtPct(probs_1x2.home),
+        draw: fmtPct(probs_1x2.draw),
+        away: fmtPct(probs_1x2.away),
+      } : null;
 
       provider = {
         winner: p?.winner || item?.winner || null,
-        win_or_draw: p?.win_or_draw ?? null,
-        under_over: p?.under_over ?? null,
-        goals: p?.goals ?? null,
-        advice: p?.advice ?? null,
-        probs_1x2,
+        win_or_draw: p?.win_or_draw ?? item?.win_or_draw ?? null,
+        under_over: p?.under_over ?? item?.under_over ?? null,
+        goals: p?.goals ?? item?.goals ?? null,
+        advice: p?.advice ?? item?.advice ?? null,
+        probs_1x2,           // numeric 0–1
+        percent_num,         // numeric 0–1 (rounded 3dp)
+        percent,             // strings like "45%"
         comparison: item?.comparison || null
       };
     }
@@ -738,7 +750,7 @@ export default async function handler(req, res){
     });
 
     const out = {
-      version: "fa-api v1.5.3",
+      version: "fa-api v1.5.4",
       asof_utc: asof,
       input: { fixture_id: fixtureId, league_id: leagueId, season: seasonYr, mode },
       mu: { mu_home, mu_away },
@@ -782,7 +794,6 @@ export default async function handler(req, res){
           home: { idealXI: pickLite(idealHome, homePR), currentXI: pickLite(currentHome, homePR) },
           away: { idealXI: pickLite(idealAway, awayPR), currentXI: pickLite(currentAway, awayPR) }
         },
-        // absences: consumer should use "confirmed_out" as "eksik"
         absences: {
           home: {
             confirmed_out: keyOutHome.length,
@@ -795,14 +806,14 @@ export default async function handler(req, res){
             listed_injuries_total: injAwayAll.length
           }
         },
-        referee: await refereeFactors(fixture),
-        tempo: { home: await teamTempoIndex(homeId), away: await teamTempoIndex(awayId) }, // kept here for completeness
-        mode_factors: { mode },
+        referee: refFx,
+        tempo: { home: tempoH, away: tempoA },
+        mode_factors: { mode, M_ref, M_tempo_home, M_tempo_away },
         h2h_low_boost_applied: h2hBoost.applied,
         market_implied: market
       },
       explanation: {
-        notes: "V1.5.3 – Eksik oyuncu sayımı düzeltildi: (startXI+bench) kadro bilinci + aktif sakat deduplikasyonu ve zaman penceresi. UI 'eksik' için absences.home.confirmed_out kullanmalı.",
+        notes: "V1.5.4 – Provider predictions UI-uyumlu: percent (\"%\" string) + percent_num (0–1). Ayrıca bench-aware lineup + aktif sakat filtresi, hakem/tempo, geniş μ, H2H boost, odds harmanı.",
         flags: { low_lineup_confidence: xiConfidence!=="high", old_snapshot:false, missing_sources:false }
       },
       xi_confidence: xiConfidence,
@@ -829,6 +840,7 @@ export default async function handler(req, res){
       out.modifiers._debug = {
         INJ_ACTIVE_WINDOW_DAYS,
         INJ_INCLUDE_DOUBTFUL,
+        provider_raw_excerpt: JSON.stringify((providerPredJs?.response||[])[0] ?? null).slice(0,1200)
       };
     }
 
