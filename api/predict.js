@@ -1,5 +1,6 @@
-// api/predict.js  —  V1.5.1
-// Odds 1X2 filter tightened + Referee name sanitization + Cross-competition tempo
+// api/predict.js  —  V1.5.2
+// Referee global fallback scan + Expanded tempo keys + Robust provider parser
+// Odds 1X2 strict filter, league μ wide window, XI-based Off/Def, H2H low-score boost, odds blend, λ cap.
 
 const API_BASE = "https://v3.football.api-sports.io";
 const KEY = process.env.APIFOOTBALL_KEY;
@@ -241,6 +242,25 @@ function detectModeFromFixture(fx) {
   return "league";
 }
 
+/* --------- Stat helpers (tempo) --------- */
+function asNumber(v){
+  if (v == null) return 0;
+  if (typeof v === "string" && v.trim().endsWith("%")) return Number(v.replace("%","")) || 0;
+  return Number(v) || 0;
+}
+function getStatValue(rows, keys /* array of lowercased keys */, fallbackPairs=[]){
+  const find = (k) => rows.find(r => (r?.type || "").toLowerCase() === k);
+  for (const k of keys){
+    const hit = find(k);
+    if (hit) return asNumber(hit.value);
+  }
+  for (const pair of fallbackPairs){
+    const a = find(pair[0]); const b = find(pair[1]);
+    if (a || b) return asNumber(a?.value) + asNumber(b?.value);
+  }
+  return 0;
+}
+
 /* --------- Referee & tempo factors --------- */
 function sanitizeRefName(ref) {
   if (!ref) return null;
@@ -250,32 +270,79 @@ function sanitizeRefName(ref) {
   s = s.replace(/\s+/g, " ").trim();
   return s || null;
 }
-function lastName(ref) {
-  if (!ref) return null;
-  const parts = ref.trim().split(/\s+/);
-  return parts.length ? parts[parts.length-1] : ref;
+function nameVariants(full){
+  if (!full) return [];
+  const parts = full.trim().split(/\s+/);
+  const ln = parts[parts.length-1];
+  const fn = parts[0];
+  const variants = new Set([
+    full, ln,
+    `${fn} ${ln}`,
+    `${(fn?.[0]||"")}. ${ln}`,
+    `${(fn?.[0]||"")} ${ln}`,
+  ].filter(Boolean));
+  return Array.from(variants);
+}
+
+const REF_FALLBACK_SCAN_DAYS   = Number(process.env.REF_FALLBACK_SCAN_DAYS || 365);
+const REF_FALLBACK_MAX_MATCHES = Number(process.env.REF_FALLBACK_MAX_MATCHES || 60);
+const REF_FALLBACK_MAX_PAGES   = Number(process.env.REF_FALLBACK_MAX_PAGES || 12);
+
+async function scanRefGloballyByLastname(lastname){
+  if (!lastname) return [];
+  const toD = new Date();
+  const fromD = new Date(toD.getTime() - REF_FALLBACK_SCAN_DAYS*24*3600*1000);
+  const from = fromD.toISOString().slice(0,10);
+  const to   = toD.toISOString().slice(0,10);
+
+  const hits = [];
+  let page = 1;
+  while (page <= REF_FALLBACK_MAX_PAGES && hits.length < REF_FALLBACK_MAX_MATCHES){
+    const js = await afGet("/fixtures", { from, to, page });
+    const resp = js?.response || [];
+    if (!resp.length) break;
+    for (const g of resp){
+      const rf = (g?.fixture?.referee || "").toLowerCase();
+      if (rf && rf.includes(String(lastname).toLowerCase())) {
+        hits.push(g);
+        if (hits.length >= REF_FALLBACK_MAX_MATCHES) break;
+      }
+    }
+    const cur = js?.paging?.current ?? page;
+    const tot = js?.paging?.total ?? page;
+    if (cur >= tot) break;
+    page++;
+  }
+  return hits;
 }
 
 async function refereeFactors(fixture) {
   const refRaw = fixture?.fixture?.referee;
-  const candidates = [];
-  const a = sanitizeRefName(refRaw);
-  if (a) candidates.push(a);
-  const ln = lastName(a);
-  if (ln && ln !== a) candidates.push(ln);
+  const clean = sanitizeRefName(refRaw);
+  const variants = nameVariants(clean);
 
+  // 1) Doğrudan referee araması
   let collected = [];
-  for (const q of candidates) {
+  for (const q of variants) {
     try {
-      const got = await afGetAll("/fixtures", { referee: q, last: 20 });
+      const got = await afGetAll("/fixtures", { referee: q, last: 40 });
       collected.push(...got);
     } catch(_) {}
   }
-  // uniq by fixture id
-  const seen = new Set(); collected = collected.filter(x => {
-    const id = x?.fixture?.id; if (!id || seen.has(id)) return false; seen.add(id); return true;
-  });
+  // uniq
+  const seen = new Set();
+  collected = collected.filter(x => { const id = x?.fixture?.id; if (!id || seen.has(id)) return false; seen.add(id); return true; });
 
+  // 2) fallback: soyadla global tarama
+  if (!collected.length && variants.length){
+    try {
+      const ln = variants.find(v => v.split(/\s+/).length === 1) || variants[0];
+      const glb = await scanRefGloballyByLastname(ln);
+      collected.push(...glb);
+    } catch(_) {}
+  }
+
+  // 3) Event + statistics ile metrik
   let n=0, yc=0, rc=0, fouls=0;
   for (const g of collected) {
     const st = (g?.fixture?.status?.short || "").toUpperCase();
@@ -311,50 +378,94 @@ async function refereeFactors(fixture) {
   if (foulsPer > 26) tempo -= 0.02;
   tempo = clamp(tempo, 0.92, 1.02);
 
-  return { has:true, name:refRaw || null, matches:n, yc:Number(ycPer.toFixed(2)), rc:Number(rcPer.toFixed(2)), fouls:Number(foulsPer.toFixed(1)), tempo_mult:Number(tempo.toFixed(3)) };
+  return {
+    has:true,
+    name:refRaw || null,
+    matches:n,
+    yc:Number(ycPer.toFixed(2)),
+    rc:Number(rcPer.toFixed(2)),
+    fouls:Number(foulsPer.toFixed(1)),
+    tempo_mult:Number(tempo.toFixed(3))
+  };
 }
 
-async function teamTempoIndex(teamId /* no season filter: cross-competition */) {
-  const last = await afGetAll("/fixtures", { team: teamId, last: 6 });
-  let n=0, shots=0, poss=0, dang=0;
+async function teamTempoIndex(teamId /* cross-competition */) {
+  // 10 maça kadar bak, lig/turnuva ayrımı yok
+  const last = await afGetAll("/fixtures", { team: teamId, last: 10 });
+  let m=0;
+  let shotsSum=0, attacksSum=0, dangSum=0, possSum=0;
 
   for (const g of last) {
     const st = (g?.fixture?.status?.short || "").toUpperCase();
     if (st !== "FT") continue;
     const fxId = g?.fixture?.id;
     if (!fxId) continue;
+
     try {
       const stx = await afGet("/fixtures/statistics", { fixture: fxId });
-      for (const r of (stx?.response || [])) {
-        const arr = r?.statistics || [];
-        const getVal = (key) => {
-          const row = arr.find(z => (z?.type || "").toLowerCase() === key);
-          let v = row?.value;
-          if (typeof v === "string" && v.endsWith("%")) v = Number(v.replace("%",""));
-          return Number(v || 0);
-        };
-        shots += getVal("total shots");
-        poss  += getVal("ball possession");
-        dang  += getVal("dangerous attacks");
-        n++;
+      if (!Array.isArray(stx?.response) || !stx.response.length) continue;
+
+      let shotsBoth=0, attacksBoth=0, dangBoth=0, possBoth=0, teams=0;
+      for (const tRow of stx.response) {
+        const arr = tRow?.statistics || [];
+        const shots = getStatValue(
+          arr,
+          ["total shots","shots total"],
+          [["shots on target","shots off target"], ["shots on goal","shots off goal"]]
+        );
+        const attacks = getStatValue(arr, ["attacks"]);
+        const dang    = getStatValue(arr, ["dangerous attacks"]);
+        const poss    = getStatValue(arr, ["ball possession"]);
+
+        shotsBoth   += shots;
+        attacksBoth += attacks;
+        dangBoth    += dang;
+        possBoth    += poss; // yüzdelik; iki takım toplamı ~100
+        teams++;
+      }
+      if (teams > 0){
+        m++;
+        shotsSum   += shotsBoth;
+        attacksSum += attacksBoth;
+        dangSum    += dangBoth;
+        possSum    += (possBoth/teams); // ~50 civarı
       }
     } catch(_) {}
   }
-  if (n===0) return { has:false, tempo_mult:1.0, meta:null };
 
-  const shotsAvg = shots / n;
-  const possAvg  = poss / n;
-  const dangAvg  = dang / n;
+  if (m===0) return { has:false, tempo_mult:1.0, meta:null };
+
+  const shotsAvg   = shotsSum / m;
+  const attacksAvg = attacksSum / m;
+  const dangAvg    = dangSum / m;
+  const possAvg    = possSum / m;
 
   let tempo = 1.0;
-  if (shotsAvg > 26) tempo += 0.03;
+  if (shotsAvg > 28) tempo += 0.03;
   if (shotsAvg < 18) tempo -= 0.02;
-  if (possAvg > 56)  tempo += 0.01;
-  if (possAvg < 44)  tempo -= 0.01;
+
+  if (attacksAvg > 200) tempo += 0.02;
+  if (attacksAvg < 140) tempo -= 0.01;
+
   if (dangAvg > 120) tempo += 0.02;
+  if (dangAvg < 75)  tempo -= 0.01;
+
+  if (possAvg > 56) tempo += 0.005;
+  if (possAvg < 44) tempo -= 0.005;
 
   tempo = clamp(tempo, 0.94, 1.06);
-  return { has:true, tempo_mult:Number(tempo.toFixed(3)), meta:{ shotsAvg:Number(shotsAvg.toFixed(1)), possAvg:Number(possAvg.toFixed(1)), dangAvg:Number(dangAvg.toFixed(0)), n } };
+
+  return {
+    has:true,
+    tempo_mult:Number(tempo.toFixed(3)),
+    meta:{
+      matches:m,
+      shotsAvg:Number(shotsAvg.toFixed(1)),
+      attacksAvg:Number(attacksAvg.toFixed(0)),
+      dangAvg:Number(dangAvg.toFixed(0)),
+      possAvg:Number(possAvg.toFixed(1))
+    }
+  };
 }
 
 /* --------- League μ (wider seasonal window) --------- */
@@ -582,7 +693,7 @@ export default async function handler(req, res){
     });
 
     const out = {
-      version: "fa-api v1.5.1",
+      version: "fa-api v1.5.2",
       asof_utc: asof,
       input: { fixture_id: fixtureId, league_id: leagueId, season: seasonYr, mode },
       mu: { mu_home, mu_away },
@@ -631,10 +742,10 @@ export default async function handler(req, res){
         tempo: { home: tempoH, away: tempoA },
         mode_factors: { mode, M_ref, M_tempo_home, M_tempo_away },
         h2h_low_boost_applied: h2hBoost.applied,
-        market_implied: oddsImplied(oddsJs)
+        market_implied: market
       },
       explanation: {
-        notes: "V1.5.1 – 1X2 pazar filtresi sıkılaştırıldı; hakem adı sanitize edilip çoklu arama denemeleri; tempo endeksi lig dışı maçları da kapsıyor. Diğer: μ geniş pencere, oyuncu-bazlı Off/Def, H2H düşük-skor boost, odds harmanı, λ cap.",
+        notes: "V1.5.2 – Hakem global fallback (soyadla tarama) + tempo için geniş istatistik anahtarları. Diğerleri: μ geniş pencere, XI-bazlı Off/Def, H2H düşük-skor boost, odds harmanı, λ cap, katı 1X2 pazar filtresi.",
         flags: { low_lineup_confidence: xiConfidence!=="high", old_snapshot:false, missing_sources:false }
       },
       xi_confidence: xiConfidence,
