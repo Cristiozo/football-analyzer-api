@@ -1,7 +1,8 @@
-// api/predict.js  —  V1.5.4
-// Provider predictions: percent (string) + percent_num (numeric) for UI compatibility
-// Also: bench-aware lineup, active-injury dedupe, strict 1X2 odds, wide μ window,
-// XI-based Off/Def, H2H low-score boost, odds blend, λ cap, referee/tempo factors.
+// api/predict.js  —  V1.5.5
+// Fix: player names always available (lineup + cross-competition /players fallback)
+// UI-friendly: provider percent (string & numeric), richer xi_players items
+// Plus: strict 1X2 odds, wide μ, XI Off/Def, H2H low-score boost, odds blend, λ cap,
+// referee & tempo factors, active-injury filter with dedupe.
 
 const API_BASE = "https://v3.football.api-sports.io";
 const KEY = process.env.APIFOOTBALL_KEY;
@@ -135,12 +136,57 @@ function ratePlayer(stat) {
 
   return { off, def, pos, minutes:min };
 }
+
+/* --------- lineup helpers (bench-aware) --------- */
+function lineupIds(lineupObj) {
+  const starters = lineupObj?.startXI || [];
+  const bench = lineupObj?.substitutes || [];
+  const all = [...starters, ...bench];
+  return all.map(x => x?.player?.id).filter(Boolean);
+}
+function namesFromLineup(lineupObj){
+  const map = new Map();
+  const starters = lineupObj?.startXI || [];
+  const bench = lineupObj?.substitutes || [];
+  for (const row of [...starters, ...bench]){
+    const id = row?.player?.id;
+    const nm = row?.player?.name;
+    if (id && nm) map.set(id, nm);
+  }
+  return map;
+}
+function mergeNameMaps(a, b){
+  const out = new Map(a ? Array.from(a.entries()) : []);
+  if (b) for (const [k,v] of b.entries()) if (!out.has(k) && v) out.set(k,v);
+  return out;
+}
 function weightForTeam(pos) {
   if (pos==="GK") return { off:0.00, def:1.00 };
   if (pos==="FWD") return { off:1.00, def:0.40 };
   if (pos==="MID") return { off:0.60, def:0.60 };
   if (pos==="DEF") return { off:0.30, def:0.90 };
   return { off:0.50, def:0.50 };
+}
+function teamFromXI(playerRatingsById, xiIds) {
+  let offSum=0, offW=0, defSum=0, defW=0;
+  const used = [];
+  for (const pid of xiIds) {
+    const pr = playerRatingsById.get(pid);
+    if (!pr) continue;
+    const w = weightForTeam(pr.pos);
+    offSum += pr.off * w.off;
+    defSum += pr.def * w.def;
+    offW += w.off;
+    defW += w.def;
+    used.push({ id: pid, off: pr.off, def: pr.def, pos: pr.pos, minutes: pr.minutes, name: pr.name });
+  }
+  const OffTeam = offW>0 ? offSum/offW : 80;
+  const DefTeam = defW>0 ? defSum/defW : 80;
+  return {
+    OffTeam: clamp(OffTeam, 20, 180),
+    DefTeam: clamp(DefTeam, 20, 180),
+    xi_detail: used
+  };
 }
 
 /* --------- injuries: dedupe + "active" filter --------- */
@@ -179,35 +225,6 @@ function injuryIsActive(rec, nowMs=Date.now()){
   }
   const maxAge = INJ_ACTIVE_WINDOW_DAYS*24*3600*1000;
   return (nowMs - ts) <= maxAge;
-}
-
-/* --------- lineup helpers (bench-aware) --------- */
-function lineupIds(lineupObj) {
-  const starters = lineupObj?.startXI || [];
-  const bench = lineupObj?.substitutes || [];
-  const all = [...starters, ...bench];
-  return all.map(x => x?.player?.id).filter(Boolean);
-}
-function teamFromXI(playerRatingsById, xiIds) {
-  let offSum=0, offW=0, defSum=0, defW=0;
-  const used = [];
-  for (const pid of xiIds) {
-    const pr = playerRatingsById.get(pid);
-    if (!pr) continue;
-    const w = weightForTeam(pr.pos);
-    offSum += pr.off * w.off;
-    defSum += pr.def * w.def;
-    offW += w.off;
-    defW += w.def;
-    used.push({ id: pid, off: pr.off, def: pr.def, pos: pr.pos, minutes: pr.minutes });
-  }
-  const OffTeam = offW>0 ? offSum/offW : 80;
-  const DefTeam = defW>0 ? defSum/defW : 80;
-  return {
-    OffTeam: clamp(OffTeam, 20, 180),
-    DefTeam: clamp(DefTeam, 20, 180),
-    xi_detail: used
-  };
 }
 
 /* --------- odds -> implied 1X2 (strict) --------- */
@@ -524,22 +541,43 @@ async function computeLeagueMu(leagueId, season) {
   return { mu_home: Number(muH.toFixed(2)), mu_away: Number(muA.toFixed(2)) };
 }
 
-/* --------- Players (ratings) --------- */
-async function teamPlayersRatings(teamId, leagueId, season) {
-  const all = await afGetAll("/players", { team: teamId, league: leagueId, season });
-  const byId = new Map();
-  for (const row of all) {
-    const pid = row?.player?.id;
-    const stat = row?.statistics?.[0];
-    if (!pid || !stat) continue;
-    byId.set(pid, ratePlayer(stat));
+/* --------- Players (ratings + names) --------- */
+async function teamPlayersData(teamId, leagueId, season) {
+  // 1) primary: league-filtered
+  const primary = await afGetAll("/players", { team: teamId, league: leagueId, season });
+  // 2) fallback: cross-competition (league param olmadan)
+  let merged = primary;
+  if (primary.length < 8) {
+    try {
+      const cross = await afGetAll("/players", { team: teamId, season });
+      // merge by player.id
+      const seen = new Set(primary.map(r => r?.player?.id));
+      merged = primary.concat(cross.filter(r => !seen.has(r?.player?.id)));
+    } catch(_) {}
   }
-  return byId;
+  const ratings = new Map();
+  const names   = new Map();
+  for (const row of merged) {
+    const pid = row?.player?.id;
+    const name = row?.player?.name;
+    const stat = row?.statistics?.[0];
+    if (pid && name) names.set(pid, name);
+    if (pid && stat) ratings.set(pid, { ...ratePlayer(stat), name });
+  }
+  return { ratings, names };
 }
 function idealXIFromRatings(ratingsMap) {
   const arr = Array.from(ratingsMap.entries()).map(([id,v])=>({id, ...v}));
   arr.sort((a,b)=> (b.minutes||0) - (a.minutes||0));
   return arr.slice(0,11).map(x=>x.id);
+}
+function pickLite(ids, ratingsMap, namesMap) {
+  return ids.map(id => {
+    const r = ratingsMap.get(id);
+    const name = namesMap?.get(id);
+    if (r) return { id, name: r.name || name || null, grp: r.pos, off: Math.round(r.off), def: Math.round(r.def) };
+    return { id, name: name || null };
+  });
 }
 
 /* ------------------------------ MAIN ------------------------------ */
@@ -571,7 +609,7 @@ export default async function handler(req, res){
       injHomeJs, injAwayJs,
       h2hJs, lineupsJs,
       oddsJs, providerPredJs,
-      homePR, awayPR
+      homePD, awayPD
     ] = await Promise.all([
       afGet("/teams/statistics", { team: homeId, league: leagueId, season: seasonYr }),
       afGet("/teams/statistics", { team: awayId, league: leagueId, season: seasonYr }),
@@ -581,9 +619,11 @@ export default async function handler(req, res){
       afGet("/fixtures/lineups", { fixture: fixtureId }),
       afGet("/odds", { fixture: fixtureId }),
       afGet("/predictions", { fixture: fixtureId }),
-      teamPlayersRatings(homeId, leagueId, seasonYr),
-      teamPlayersRatings(awayId, leagueId, seasonYr)
+      teamPlayersData(homeId, leagueId, seasonYr),
+      teamPlayersData(awayId, leagueId, seasonYr)
     ]);
+
+    const homePR = homePD.ratings, awayPR = awayPD.ratings;
 
     const { mu_home, mu_away } = await computeLeagueMu(leagueId, seasonYr);
     const mu_team = (mu_home+mu_away)/2;
@@ -595,10 +635,15 @@ export default async function handler(req, res){
     const gfA = Number(as?.goals?.for?.average?.total ?? 1.3);
     const gaA = Number(as?.goals?.against?.average?.total ?? 1.3);
 
-    // lineups (bench-aware)
+    // lineups (bench-aware) + names from lineup
     const lineups = lineupsJs?.response || [];
-    const xiHomeIds = lineupIds(lineups.find(x=>x?.team?.id===homeId)) || [];
-    const xiAwayIds = lineupIds(lineups.find(x=>x?.team?.id===awayId)) || [];
+    const luHome = lineups.find(x=>x?.team?.id===homeId) || {};
+    const luAway = lineups.find(x=>x?.team?.id===awayId) || {};
+    const xiHomeIds = lineupIds(luHome) || [];
+    const xiAwayIds = lineupIds(luAway) || [];
+    const namesHome = mergeNameMaps(homePD.names, namesFromLineup(luHome));
+    const namesAway = mergeNameMaps(awayPD.names, namesFromLineup(luAway));
+
     const xiAvailable = (xiHomeIds.length>0 && xiAwayIds.length>0 && kickoff>now);
     const xiConfidence = xiAvailable ? "high" : (kickoff - now < 90*60*1000 ? "medium" : "low");
 
@@ -622,7 +667,7 @@ export default async function handler(req, res){
     const injIdsHome = new Set(injHomeActive.map(x=>x?.player?.id).filter(Boolean));
     const injIdsAway = new Set(injAwayActive.map(x=>x?.player?.id).filter(Boolean));
 
-    // confirmed_out = ideal XI oyuncusu + maç günü kadrosunda yok + aktif sakat listesinde
+    // confirmed_out = ideal XI oyuncusu + maç kadrosunda yok + aktif sakat listesinde
     const squadSetHome = new Set(currentHome);
     const squadSetAway = new Set(currentAway);
     const keyOutHome = idealHome.filter(id => !squadSetHome.has(id) && injIdsHome.has(id));
@@ -655,7 +700,7 @@ export default async function handler(req, res){
     if (xiConfidence === "medium") { lambda_home*=0.97; lambda_away*=0.97; }
     if (xiConfidence === "low")    { lambda_home*=0.94; lambda_away*=0.94; }
 
-    // Referee & tempo (reused later, no duplicate calls)
+    // Referee & tempo
     const [refFx, tempoH, tempoA] = await Promise.all([
       refereeFactors(fixture),
       teamTempoIndex(homeId),
@@ -719,7 +764,6 @@ export default async function handler(req, res){
       };
       const probs_1x2 = (pn.home!=null && pn.draw!=null && pn.away!=null) ? pn : null;
 
-      // Build both numeric & string percent for frontends
       const percent_num = probs_1x2 ? {
         home: Number(probs_1x2.home.toFixed(3)),
         draw: Number(probs_1x2.draw.toFixed(3)),
@@ -737,20 +781,13 @@ export default async function handler(req, res){
         under_over: p?.under_over ?? item?.under_over ?? null,
         goals: p?.goals ?? item?.goals ?? null,
         advice: p?.advice ?? item?.advice ?? null,
-        probs_1x2,           // numeric 0–1
-        percent_num,         // numeric 0–1 (rounded 3dp)
-        percent,             // strings like "45%"
+        probs_1x2, percent_num, percent,
         comparison: item?.comparison || null
       };
     }
 
-    const pickLite = (ids, map) => ids.map(id => {
-      const r = map.get(id);
-      return r ? { id, grp: r.pos, off: Math.round(r.off), def: Math.round(r.def) } : { id };
-    });
-
     const out = {
-      version: "fa-api v1.5.4",
+      version: "fa-api v1.5.5",
       asof_utc: asof,
       input: { fixture_id: fixtureId, league_id: leagueId, season: seasonYr, mode },
       mu: { mu_home, mu_away },
@@ -791,8 +828,16 @@ export default async function handler(req, res){
           }
         },
         xi_players: {
-          home: { idealXI: pickLite(idealHome, homePR), currentXI: pickLite(currentHome, homePR) },
-          away: { idealXI: pickLite(idealAway, awayPR), currentXI: pickLite(currentAway, awayPR) }
+          home: {
+            idealXI: pickLite(idealHome, homePR, namesHome),
+            currentXI: pickLite(currentHome, homePR, namesHome),
+            key_out: pickLite(keyOutHome, homePR, namesHome)
+          },
+          away: {
+            idealXI: pickLite(idealAway, awayPR, namesAway),
+            currentXI: pickLite(currentAway, awayPR, namesAway),
+            key_out: pickLite(keyOutAway, awayPR, namesAway)
+          }
         },
         absences: {
           home: {
@@ -813,7 +858,7 @@ export default async function handler(req, res){
         market_implied: market
       },
       explanation: {
-        notes: "V1.5.4 – Provider predictions UI-uyumlu: percent (\"%\" string) + percent_num (0–1). Ayrıca bench-aware lineup + aktif sakat filtresi, hakem/tempo, geniş μ, H2H boost, odds harmanı.",
+        notes: "V1.5.5 – İsimler garanti (lineup + cross-competition players fallback); provider percent string/numeric; bench-aware lineup; aktif sakat filtresi; hakem/tempo; geniş μ; H2H boost; odds harmanı; λ cap.",
         flags: { low_lineup_confidence: xiConfidence!=="high", old_snapshot:false, missing_sources:false }
       },
       xi_confidence: xiConfidence,
@@ -832,7 +877,9 @@ export default async function handler(req, res){
         `${API_BASE}/odds?fixture=${fixtureId}`,
         `${API_BASE}/predictions?fixture=${fixtureId}`,
         `${API_BASE}/players?team=${homeId}&league=${leagueId}&season=${seasonYr}`,
-        `${API_BASE}/players?team=${awayId}&league=${leagueId}&season=${seasonYr}`
+        `${API_BASE}/players?team=${awayId}&league=${leagueId}&season=${seasonYr}`,
+        `${API_BASE}/players?team=${homeId}&season=${seasonYr}`,
+        `${API_BASE}/players?team=${awayId}&season=${seasonYr}`
       ]
     };
 
