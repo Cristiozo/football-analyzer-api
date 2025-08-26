@@ -1,4 +1,4 @@
-// api/predict.js  —  V1.4 (players+XI, dynamic μ, odds blend, H2H low-score boost)
+// api/predict.js  —  V1.4.1 (robust provider predictions + wider μ window + optional debug)
 
 const API_BASE = "https://v3.football.api-sports.io";
 const KEY = process.env.APIFOOTBALL_KEY;
@@ -14,7 +14,6 @@ async function afGet(path, params = {}) {
   const json = await res.json();
   return json;
 }
-// paginate until paging.total
 async function afGetAll(path, params = {}) {
   let page = 1;
   const all = [];
@@ -37,7 +36,6 @@ function poissonP(k, lambda){ return Math.exp(-lambda) * Math.pow(lambda, k) / f
 function scoreMatrix(lambdaH, lambdaA) {
   const SIZE=7; const m=Array.from({length:SIZE},()=>Array(SIZE).fill(0));
   for (let h=0; h<SIZE; h++) for (let a=0; a<SIZE; a++) m[h][a]=poissonP(h,lambdaH)*poissonP(a,lambdaA);
-  // light DC adjustment base
   const dc=1.06; m[0][0]*=dc; m[1][0]*=dc; m[0][1]*=dc; m[1][1]*=dc;
   const s=m.flat().reduce((x,y)=>x+y,0); for (let h=0; h<SIZE; h++) for (let a=0; a<SIZE; a++) m[h][a]/=s;
   return m;
@@ -67,10 +65,9 @@ const posGroup = (p)=> {
   if (s.startsWith("D")) return "DEF";
   if (s.startsWith("M")) return "MID";
   if (s.startsWith("F") || s.includes("W")) return "FWD";
-  return "MID"; // fallback
+  return "MID";
 };
 
-// build player ratings (Off/Def: 0..100) from API-FOOTBALL stats
 function ratePlayer(stat) {
   const g = stat?.games || {};
   const min = toNum(g.minutes);
@@ -82,13 +79,12 @@ function ratePlayer(stat) {
   const tack = stat?.tackles || {};
   const duels = stat?.duels || {};
   const cards = stat?.cards || {};
-  // GK specific
+
   const conceded = toNum(goals.conceded);
   const saves = toNum(goals.saves);
   const sotFaced = saves + conceded;
   const savePct = sotFaced>0 ? saves/sotFaced : 0;
 
-  // per90s
   const g90 = per90(goals.total, min);
   const a90 = per90(goals.assists, min);
   const sot90 = per90(shots.on, min);
@@ -103,18 +99,17 @@ function ratePlayer(stat) {
   const y = toNum(cards.yellow);
   const r = toNum(cards.red);
 
-  // role weights (simple, robust)
   let off, def;
   if (pos==="GK") {
     const gc90 = per90(conceded, min);
     const penSave90 = per90(stat?.penalty?.saved, min);
     const sScore = 0.7*savePct + 0.2*(1 - clamp(gc90/2.0,0,1)) + 0.1*clamp(penSave90/0.2,0,1);
     def = 50 + 50*sScore;
-    off = 20; // GK hücum etkisi yok sayılır
+    off = 20;
   } else if (pos==="FWD") {
     const o = 0.45*g90 + 0.2*a90 + 0.15*sot90 + 0.12*kp90 + 0.08*drSucc90;
     const d = 0.35*tk90 + 0.25*int90 + 0.15*blk90 + 0.25*(duTot90*duWinRate);
-    off = 100*clamp(o/1.2, 0, 1); // ölçek: tipik üst seviye ~1.2 g+a90
+    off = 100*clamp(o/1.2, 0, 1);
     def = 100*clamp(d/1.0, 0, 1);
   } else if (pos==="MID") {
     const o = 0.25*g90 + 0.25*a90 + 0.2*kp90 + 0.15*drSucc90 + 0.15*sot90;
@@ -128,12 +123,10 @@ function ratePlayer(stat) {
     def = 100*clamp(d/1.4, 0, 1);
   }
 
-  // discipline küçük ceza
   const discPenalty = clamp(1 - (0.02*y + 0.08*r), 0.85, 1);
   off *= discPenalty; def *= discPenalty;
 
-  // very low sample -> shrink
-  const shrink = clamp(min/540 /*6x90*/, 0.35, 1);
+  const shrink = clamp((min/540), 0.35, 1);
   off = 50 + (off-50)*shrink;
   def = 50 + (def-50)*shrink;
 
@@ -141,21 +134,16 @@ function ratePlayer(stat) {
 }
 
 function weightForTeam(pos) {
-  // takıma katkı ağırlıkları (Off/Def)
   if (pos==="GK") return { off:0.00, def:1.00 };
   if (pos==="FWD") return { off:1.00, def:0.40 };
   if (pos==="MID") return { off:0.60, def:0.60 };
   if (pos==="DEF") return { off:0.30, def:0.90 };
   return { off:0.50, def:0.50 };
 }
-
-// map lineup array -> ids
 function lineupIds(lineupObj) {
   const arr = lineupObj?.startXI || [];
   return arr.map(x => x?.player?.id).filter(Boolean);
 }
-
-// compute team Off/Def from a specific XI list
 function teamFromXI(playerRatingsById, xiIds) {
   let offSum=0, offW=0, defSum=0, defW=0;
   const used = [];
@@ -169,7 +157,7 @@ function teamFromXI(playerRatingsById, xiIds) {
     defW += w.def;
     used.push({ id: pid, off: pr.off, def: pr.def, pos: pr.pos, minutes: pr.minutes });
   }
-  const OffTeam = offW>0 ? offSum/offW : 80; // fallback
+  const OffTeam = offW>0 ? offSum/offW : 80;
   const DefTeam = defW>0 ? defSum/defW : 80;
   return {
     OffTeam: clamp(OffTeam, 20, 180),
@@ -178,7 +166,7 @@ function teamFromXI(playerRatingsById, xiIds) {
   };
 }
 
-// odds -> implied 1X2 (average of bookmakers that have "Match Winner"/"1X2")
+// odds -> implied 1X2
 function oddsImplied(oddsResp) {
   const rs = oddsResp?.response || [];
   const triplets = [];
@@ -186,7 +174,7 @@ function oddsImplied(oddsResp) {
     for (const bm of (fx.bookmakers||[])) {
       for (const bet of (bm.bets||[])) {
         const name = (bet.name||"").toLowerCase();
-        if (name.includes("match") || name.includes("1x2")) {
+        if (name.includes("match") || name.includes("1x2") || name.includes("winner")) {
           let h=null,d=null,a=null;
           for (const v of (bet.values||[])) {
             const nm=(v.value||"").toLowerCase();
@@ -210,19 +198,18 @@ function oddsImplied(oddsResp) {
   return { home:avg.home/n, draw:avg.draw/n, away:avg.away/n };
 }
 
-// H2H düşük skor paterni -> boost cells [0-0,1-0,0-1]
+// H2H düşük skor paterni
 function applyLowScoreBoost(m, h2hResp) {
   const rows = h2hResp?.response || [];
   const recent = rows.slice(0,6).filter(x => (x?.fixture?.status?.short||"").toUpperCase()==="FT");
   if (recent.length<3) return { matrix:m, applied:false };
-  let totalGoals=0, lowCount=0, zeroZero=0;
+  let totalGoals=0, lowCount=0;
   for (const r of recent) {
     const gh = r?.goals?.home ?? r?.score?.fulltime?.home ?? 0;
     const ga = r?.goals?.away ?? r?.score?.fulltime?.away ?? 0;
     const tg = toNum(gh)+toNum(ga);
     totalGoals += tg;
     if (tg<=1) lowCount++;
-    if (tg===0) zeroZero++;
   }
   const avg = totalGoals / recent.length;
   const strongLow = avg < 1.8 || lowCount >= 3;
@@ -230,29 +217,26 @@ function applyLowScoreBoost(m, h2hResp) {
 
   const SIZE = m.length;
   const clone = m.map(r=>r.slice());
-  const add = 0.015; // küçük kütle ekle
+  const add = 0.015;
   clone[0][0] += add;
   clone[1][0] += add;
   clone[0][1] += add;
-  // renormalize
   let s = clone.flat().reduce((x,y)=>x+y,0);
   for (let h=0; h<SIZE; h++) for (let a=0; a<SIZE; a++) clone[h][a] /= s;
   return { matrix: clone, applied:true };
 }
 
-// compute league μ from completed fixtures (up to now)
+// league μ (wider window)
 async function computeLeagueMu(leagueId, season) {
-  // Limit range to the season year +- a few months
+  const from = `${season-1}-07-01`;
+  const to = `${season+1}-06-30`;
   const nowISO = new Date().toISOString();
-  // API supports from/to
-  const fixtures = await afGetAll("/fixtures", {
-    league: leagueId, season, from: `${season}-01-01`, to: `${season}-12-31`
-  });
+  const fixtures = await afGetAll("/fixtures", { league: leagueId, season, from, to });
   let n=0, homeGoals=0, awayGoals=0;
   for (const f of fixtures) {
     const st = (f?.fixture?.status?.short||"").toUpperCase();
     const dISO = f?.fixture?.date;
-    if (!dISO || new Date(dISO).toISOString() >= nowISO) continue; // future guard (as-of)
+    if (!dISO || new Date(dISO).toISOString() >= nowISO) continue;
     if (st!=="FT") continue;
     const gh = f?.goals?.home ?? f?.score?.fulltime?.home ?? 0;
     const ga = f?.goals?.away ?? f?.score?.fulltime?.away ?? 0;
@@ -264,7 +248,7 @@ async function computeLeagueMu(leagueId, season) {
   return { mu_home: Number(muH.toFixed(2)), mu_away: Number(muA.toFixed(2)) };
 }
 
-// assemble player ratings map for a team
+// players
 async function teamPlayersRatings(teamId, leagueId, season) {
   const all = await afGetAll("/players", { team: teamId, league: leagueId, season });
   const byId = new Map();
@@ -277,20 +261,19 @@ async function teamPlayersRatings(teamId, leagueId, season) {
   }
   return byId;
 }
-
-// ideal XI = top 11 minutes
 function idealXIFromRatings(ratingsMap) {
   const arr = Array.from(ratingsMap.entries()).map(([id,v])=>({id, ...v}));
   arr.sort((a,b)=> (b.minutes||0) - (a.minutes||0));
   return arr.slice(0,11).map(x=>x.id);
 }
 
-// ---------- main handler ----------
+// ---------- MAIN ----------
 export default async function handler(req, res){
   try{
     if (!KEY) return res.status(500).json({ error: "Missing APIFOOTBALL_KEY env var" });
 
     const fixtureId = req.query.fixture ? String(req.query.fixture) : undefined;
+    const debug = String(req.query.debug||"") === "1";
     if (!fixtureId) return res.status(400).json({ error: "Pass ?fixture={id}" });
 
     const asof = new Date().toISOString();
@@ -307,7 +290,6 @@ export default async function handler(req, res){
     const now = Date.now();
     const kickoff = new Date(kickoffISO).getTime();
 
-    // Core pulls (parallel)
     const [
       homeStatsJs, awayStatsJs,
       injHomeJs, injAwayJs,
@@ -324,11 +306,9 @@ export default async function handler(req, res){
       afGet("/predictions", { fixture: fixtureId })
     ]);
 
-    // Dynamic league μ (from completed fixtures of same season)
     const { mu_home, mu_away } = await computeLeagueMu(leagueId, seasonYr);
     const mu_team = (mu_home+mu_away)/2;
 
-    // Team-level base (fallbacks are moderate)
     const hs = homeStatsJs?.response || {};
     const as = awayStatsJs?.response || {};
     const gfH = Number(hs?.goals?.for?.average?.total ?? 1.3);
@@ -336,30 +316,25 @@ export default async function handler(req, res){
     const gfA = Number(as?.goals?.for?.average?.total ?? 1.3);
     const gaA = Number(as?.goals?.against?.average?.total ?? 1.3);
 
-    // Player ratings (league+season filtered)
     const [homePR, awayPR] = await Promise.all([
       teamPlayersRatings(homeId, leagueId, seasonYr),
       teamPlayersRatings(awayId, leagueId, seasonYr)
     ]);
 
-    // Lineups
     const lineups = lineupsJs?.response || [];
     const xiHomeIds = lineupIds(lineups.find(x=>x?.team?.id===homeId)) || [];
     const xiAwayIds = lineupIds(lineups.find(x=>x?.team?.id===awayId)) || [];
     const xiAvailable = (xiHomeIds.length>0 && xiAwayIds.length>0 && kickoff>now);
     const xiConfidence = xiAvailable ? "high" : (kickoff - now < 90*60*1000 ? "medium" : "low");
 
-    // Ideal XIs (minutes-based)
     const idealHome = idealXIFromRatings(homePR);
     const idealAway = idealXIFromRatings(awayPR);
     const currentHome = xiHomeIds.length ? xiHomeIds : idealHome;
     const currentAway = xiAwayIds.length ? xiAwayIds : idealAway;
 
-    // Team Off/Def from XI
     const teamH = teamFromXI(homePR, currentHome);
     const teamA = teamFromXI(awayPR, currentAway);
 
-    // XI factor vs ideal XI (bilgi amaçlı)
     const idealH = teamFromXI(homePR, idealHome);
     const idealA = teamFromXI(awayPR, idealAway);
     const xiFactors = {
@@ -373,7 +348,6 @@ export default async function handler(req, res){
       }
     };
 
-    // Injuries / key_out (ideal XI'de olup current XI'de olmayanlar + injury listesinde olanlar)
     const injHome = injHomeJs?.response || [];
     const injAway = injAwayJs?.response || [];
     const injIdsHome = new Set(injHome.map(x=>x?.player?.id).filter(Boolean));
@@ -381,60 +355,48 @@ export default async function handler(req, res){
     const keyOutHome = idealHome.filter(id => !currentHome.includes(id) && injIdsHome.has(id));
     const keyOutAway = idealAway.filter(id => !currentAway.includes(id) && injIdsAway.has(id));
 
-    // Base Off/Def from team stats (scaled), then blend with XI-based
     const clampOD = (x)=> clamp(x, 20, 180);
     const offH_stats = clampOD((gfH/mu_team)*100);
     const defH_stats = clampOD((mu_team/gaH)*100);
     const offA_stats = clampOD((gfA/mu_team)*100);
     const defA_stats = clampOD((mu_team/gaA)*100);
 
-    // XI-based already in 0..180-ish; unify scale to 0..100 domain by linear map
-    const norm = (x)=> clamp( (x/100)*100 , 20, 180 ); // (already similar range)
+    const norm = (x)=> clamp( (x/100)*100 , 20, 180 );
     const offH_xi = norm(teamH.OffTeam);
     const defH_xi = norm(teamH.DefTeam);
     const offA_xi = norm(teamA.OffTeam);
     const defA_xi = norm(teamA.DefTeam);
 
-    // Blend: give XI 60%, season team stats 40%
     const OffH = 0.6*offH_xi + 0.4*offH_stats;
     const DefH = 0.6*defH_xi + 0.4*defH_stats;
     const OffA = 0.6*offA_xi + 0.4*offA_stats;
     const DefA = 0.6*defA_xi + 0.4*defA_stats;
 
-    // SoS (çok basit, mevcutsa hs formundan ufak çarpan)
     const sosHomeOff = clamp((toNum(hs?.form?.att?.value)||1), 0.8, 1.2);
     const sosHomeDef = clamp((toNum(hs?.form?.def?.value)||1), 0.8, 1.2);
     const sosAwayOff = clamp((toNum(as?.form?.att?.value)||1), 0.8, 1.2);
     const sosAwayDef = clamp((toNum(as?.form?.def?.value)||1), 0.8, 1.2);
 
-    // λ
     let lambda_home = mu_home * (OffH/100) * (100/DefA) * sosHomeOff * (1/sosAwayDef);
     let lambda_away = mu_away * (OffA/100) * (100/DefH) * sosAwayOff * (1/sosHomeDef);
 
-    // lineup confidence shrink (as-of belirsizlik)
     if (xiConfidence === "medium") { lambda_home*=0.97; lambda_away*=0.97; }
     if (xiConfidence === "low")    { lambda_home*=0.94; lambda_away*=0.94; }
 
-    // squash + cap for stability
     lambda_home = clamp(lambda_home, 0.2, 3.8);
     lambda_away = clamp(lambda_away, 0.2, 3.8);
 
-    // Base grid
     let grid = scoreMatrix(lambda_home, lambda_away);
-
-    // H2H low-score boost
     const h2hBoost = applyLowScoreBoost(grid, h2hJs);
     grid = h2hBoost.matrix;
 
-    // probs
     const win = sum1X2(grid);
     const btts = bttsYes(grid);
     const over = over25(grid);
     const under = 1 - over;
 
-    // market implied & blend
     const market = oddsImplied(oddsJs);
-    const blend = (m,b,alpha=0.75)=> { // model ağırlığı 0.75
+    const blend = (m,b,alpha=0.75)=> {
       if (!b) return m;
       return {
         home: clamp(alpha*m.home + (1-alpha)*b.home, 0, 1),
@@ -444,20 +406,39 @@ export default async function handler(req, res){
     };
     const win_blended = blend(win, market);
 
-    // provider predictions normalize (optional pretty)
+    // -------- Robust provider predictions parser --------
     let provider = null;
-    const pMain = providerPredJs?.response?.[0]?.predictions?.[0];
-    if (pMain) {
-      const pct = pMain?.percent;
-      const toP = s => (typeof s==="string" ? Number(s.replace("%",""))/100 : null);
+    const r = providerPredJs?.response;
+    if (Array.isArray(r) && r.length) {
+      const item = r[0] || {};
+      // predictions may be array OR object OR nested
+      let p = null;
+      if (Array.isArray(item.predictions) && item.predictions.length) p = item.predictions[0];
+      else if (item.predictions && typeof item.predictions === "object") p = item.predictions;
+      else if (item.prediction && typeof item.prediction === "object") p = item.prediction;
+      else if (item.data?.predictions) p = Array.isArray(item.data.predictions) ? item.data.predictions[0] : item.data.predictions;
+
+      // percent may live on p.percent or item.percent
+      const percent = p?.percent || item?.percent || null;
+      const toP = s => (typeof s==="string" ? Number(s.replace("%",""))/100
+                        : (typeof s==="number" ? s : null));
+      let probs_1x2 = null;
+      if (percent && (percent.home ?? percent.Home) != null) {
+        probs_1x2 = {
+          home: toP(percent.home ?? percent.Home),
+          draw: toP(percent.draw ?? percent.Draw),
+          away: toP(percent.away ?? percent.Away)
+        };
+      }
+
       provider = {
-        winner: pMain?.winner || null,
-        win_or_draw: pMain?.win_or_draw ?? null,
-        under_over: pMain?.under_over ?? null,
-        goals: pMain?.goals ?? null,
-        advice: pMain?.advice ?? null,
-        probs_1x2: pct ? { home: toP(pct.home), draw: toP(pct.draw), away: toP(pct.away) } : null,
-        comparison: providerPredJs?.response?.[0]?.comparison || null
+        winner: p?.winner || item?.winner || null,
+        win_or_draw: p?.win_or_draw ?? null,
+        under_over: p?.under_over ?? null,
+        goals: p?.goals ?? null,
+        advice: p?.advice ?? null,
+        probs_1x2,
+        comparison: item?.comparison || null
       };
     }
 
@@ -465,15 +446,13 @@ export default async function handler(req, res){
     const injHomeCount = (injHomeJs?.response||[]).length;
     const injAwayCount = (injAwayJs?.response||[]).length;
 
-    // build xi_players section (compact)
     const pickLite = (ids, map) => ids.map(id => {
       const r = map.get(id);
       return r ? { id, grp: r.pos, off: Math.round(r.off), def: Math.round(r.def) } : { id };
     });
 
-    // Output
-    return res.status(200).json({
-      version: "fa-api v1.4.0",
+    const out = {
+      version: "fa-api v1.4.1",
       asof_utc: asof,
       input: { fixture_id: fixtureId, league_id: leagueId, season: seasonYr, mode: "league" },
       mu: { mu_home, mu_away },
@@ -496,32 +475,33 @@ export default async function handler(req, res){
         top_scores: topScores(grid, 5),
         score_matrix: grid.map(r=>r.map(x=>Number(x.toFixed(6)))),
         offdef: {
-          home_off: Number(OffH.toFixed(1)),
-          home_def: Number(DefH.toFixed(1)),
-          away_off: Number(OffA.toFixed(1)),
-          away_def: Number(DefA.toFixed(1))
+          home_off: Number((0.6*teamH.OffTeam + 0.4*clamp((gfH/mu_team)*100,20,180)).toFixed(1)),
+          home_def: Number((0.6*teamH.DefTeam + 0.4*clamp((mu_team/gaH)*100,20,180)).toFixed(1)),
+          away_off: Number((0.6*teamA.OffTeam + 0.4*clamp((gfA/mu_team)*100,20,180)).toFixed(1)),
+          away_def: Number((0.6*teamA.DefTeam + 0.4*clamp((mu_team/gaA)*100,20,180)).toFixed(1))
         }
       },
       modifiers: {
-        xi_factors: xiFactors,
-        xi_players: {
+        xi_factors: {
           home: {
-            idealXI: pickLite(idealHome, homePR),
-            currentXI: pickLite(currentHome, homePR),
-            key_out: keyOutHome
+            off: idealH.OffTeam>0 ? Number((teamH.OffTeam/idealH.OffTeam).toFixed(3)) : 1,
+            def: idealH.DefTeam>0 ? Number((teamH.DefTeam/idealH.DefTeam).toFixed(3)) : 1
           },
           away: {
-            idealXI: pickLite(idealAway, awayPR),
-            currentXI: pickLite(currentAway, awayPR),
-            key_out: keyOutAway
+            off: idealA.OffTeam>0 ? Number((teamA.OffTeam/idealA.OffTeam).toFixed(3)) : 1,
+            def: idealA.DefTeam>0 ? Number((teamA.DefTeam/idealA.DefTeam).toFixed(3)) : 1
           }
+        },
+        xi_players: {
+          home: { idealXI: pickLite(idealHome, homePR), currentXI: pickLite(currentHome, homePR), key_out: keyOutHome },
+          away: { idealXI: pickLite(idealAway, awayPR), currentXI: pickLite(currentAway, awayPR), key_out: keyOutAway }
         },
         injuries: { home_count: injHomeCount, away_count: injAwayCount },
         h2h_low_boost_applied: h2hBoost.applied,
         market_implied: market
       },
       explanation: {
-        notes: "V1.4 – XI-temelli oyuncu puanları (per90), ideal vs current XI etkisi, dinamik lig μ (FT maçlardan), odds harmanlı 1X2, H2H düşük-skor boost, squash+cap.",
+        notes: "V1.4.1 – predictions parser güçlendirildi (array/obj destek); lig μ penceresi genişletildi; debug seçeneği eklendi.",
         flags: { low_lineup_confidence: xiConfidence!=="high", old_snapshot:false, missing_sources:false }
       },
       xi_confidence: xiConfidence,
@@ -540,7 +520,15 @@ export default async function handler(req, res){
         `${API_BASE}/players?team=${homeId}&league=${leagueId}&season=${seasonYr}`,
         `${API_BASE}/players?team=${awayId}&league=${leagueId}&season=${seasonYr}`
       ]
-    });
+    };
+
+    if (debug) {
+      out.modifiers.provider_raw_excerpt = JSON.stringify(
+        (providerPredJs?.response||[])[0] ?? null
+      ).slice(0, 1000); // kısa tut
+    }
+
+    return res.status(200).json(out);
 
   } catch (err){
     return res.status(500).json({ error: err?.message || "Internal error" });
