@@ -1,0 +1,150 @@
+import type { VercelRequest, VercelResponse } from "@vercel/node";
+
+const API_BASE = "https://v3.football.api-sports.io";
+const KEY = process.env.APIFOOTBALL_KEY as string;
+
+async function afGet(path: string, params: Record<string, any>) {
+  const qs = new URLSearchParams(
+    Object.entries(params).filter(([, v]) => v !== undefined && v !== null)
+  ).toString();
+  const url = `${API_BASE}${path}?${qs}`;
+  const res = await fetch(url, { headers: { "x-apisports-key": KEY } });
+  if (!res.ok) throw new Error(`API error ${res.status} on ${path}`);
+  const json = await res.json();
+  return json?.response ?? [];
+}
+
+function factorial(n: number) { let f=1; for (let i=2;i<=n;i++) f*=i; return f; }
+function poissonP(k: number, lambda: number) {
+  return Math.exp(-lambda) * Math.pow(lambda, k) / factorial(k);
+}
+function scoreMatrix(lambdaH: number, lambdaA: number) {
+  const SIZE = 7; const m = Array.from({length: SIZE}, () => Array(SIZE).fill(0));
+  for (let h=0; h<SIZE; h++) for (let a=0; a<SIZE; a++) m[h][a] = poissonP(h, lambdaH) * poissonP(a, lambdaA);
+  // very light DC tweak on low scores
+  const dc = 1.06;
+  m[0][0] *= dc; m[1][0] *= dc; m[0][1] *= dc; m[1][1] *= dc;
+  const s = m.flat().reduce((x,y)=>x+y,0);
+  for (let h=0; h<SIZE; h++) for (let a=0; a<SIZE; a++) m[h][a] /= s;
+  return m;
+}
+function sum1X2(m: number[][]) {
+  let H=0,D=0,A=0;
+  for (let h=0; h<m.length; h++) for (let a=0; a<m[h].length; a++) {
+    if (h>a) H+=m[h][a]; else if (h===a) D+=m[h][a]; else A+=m[h][a];
+  }
+  return { home: H, draw: D, away: A };
+}
+function bttsYes(m: number[][]) { let p=0; for (let h=1; h<m.length; h++) for (let a=1; a<m[h].length; a++) p+=m[h][a]; return p; }
+function over25(m: number[][]) { let p=0; for (let h=0; h<m.length; h++) for (let a=0; a<m[h].length; a++) if (h+a>=3) p+=m[h][a]; return p; }
+
+export default async function handler(req: VercelRequest, res: VercelResponse) {
+  try {
+    if (!KEY) return res.status(500).json({ error: "Missing APIFOOTBALL_KEY env var" });
+
+    const fixtureId = req.query.fixture ? String(req.query.fixture) : undefined;
+    if (!fixtureId) return res.status(400).json({ error: "Pass ?fixture={id}" });
+
+    const asof = new Date().toISOString();
+
+    const fx = await afGet("/fixtures", { id: fixtureId });
+    const fixture = fx[0];
+    if (!fixture) return res.status(404).json({ error: "Fixture not found" });
+
+    const homeId = fixture.teams?.home?.id;
+    const awayId = fixture.teams?.away?.id;
+    const leagueId = fixture.league?.id;
+    const seasonYr = fixture.league?.season;
+
+    const kickoffISO = fixture.fixture?.date;
+    if (!kickoffISO) throw new Error("Kickoff time missing");
+    const now = Date.now();
+    const kickoff = new Date(kickoffISO).getTime();
+
+    const [homeStats, awayStats] = await Promise.all([
+      afGet("/teams/statistics", { team: homeId, league: leagueId, season: seasonYr }),
+      afGet("/teams/statistics", { team: awayId, league: leagueId, season: seasonYr })
+    ]);
+    const [injHome, injAway, h2h, lineups, odds, providerPred] = await Promise.all([
+      afGet("/injuries", { team: homeId, season: seasonYr }),
+      afGet("/injuries", { team: awayId, season: seasonYr }),
+      afGet("/fixtures/headtohead", { h2h: `${homeId}-${awayId}`, last: 10 }),
+      afGet("/fixtures/lineups", { fixture: fixtureId }),
+      afGet("/odds", { fixture: fixtureId }),
+      afGet("/predictions", { fixture: fixtureId })
+    ]);
+
+    const gfH = Number(homeStats?.goals?.for?.average?.total ?? 1.4);
+    const gaH = Number(homeStats?.goals?.against?.average?.total ?? 1.4);
+    const gfA = Number(awayStats?.goals?.for?.average?.total ?? 1.4);
+    const gaA = Number(awayStats?.goals?.against?.average?.total ?? 1.4);
+
+    const mu_home = 1.60, mu_away = 1.20, mu_team = (mu_home+mu_away)/2;
+
+    const clamp = (x:number) => Math.max(20, Math.min(180, x));
+    const OffH = clamp((gfH/mu_team)*100);
+    const DefH = clamp((mu_team/gaH)*100);
+    const OffA = clamp((gfA/mu_team)*100);
+    const DefA = clamp((mu_team/gaA)*100);
+
+    const xiAvailable = Array.isArray(lineups) && lineups.length>0 && kickoff>now && lineups[0]?.startXI?.length;
+    const xiConfidence = xiAvailable ? "high" : (kickoff - now < 90*60*1000 ? "medium" : "low");
+
+    let lambda_home = mu_home * (OffH/100) * (100/DefA);
+    let lambda_away = mu_away * (OffA/100) * (100/DefH);
+    if (xiConfidence === "medium") { lambda_home*=0.97; lambda_away*=0.97; }
+    if (xiConfidence === "low")    { lambda_home*=0.94; lambda_away*=0.94; }
+
+    const grid = scoreMatrix(lambda_home, lambda_away);
+    const win = sum1X2(grid);
+    const btts = bttsYes(grid);
+    const over = over25(grid);
+    const under = 1 - over;
+
+    const scores: {score:string, prob:number}[] = [];
+    for (let h=0; h<7; h++) for (let a=0; a<7; a++) scores.push({ score: `${h}-${a}`, prob: grid[h][a] });
+    scores.sort((x,y)=>y.prob-x.prob);
+    const top5 = scores.slice(0,5).map(s=>({ score: s.score, prob: Number(s.prob.toFixed(3)) }));
+
+    const providerPredictions = Array.isArray(providerPred) && providerPred[0]?.predictions
+      ? providerPred[0]?.predictions : null;
+
+    res.status(200).json({
+      asof_utc: asof,
+      input: { fixture_id: fixtureId, league_id: leagueId, season: seasonYr },
+      prediction: {
+        lambda_home: Number(lambda_home.toFixed(3)),
+        lambda_away: Number(lambda_away.toFixed(3)),
+        win_probs: {
+          home: Number(win.home.toFixed(3)),
+          draw: Number(win.draw.toFixed(3)),
+          away: Number(win.away.toFixed(3))
+        },
+        btts_yes: Number(btts.toFixed(3)),
+        over25: Number(over.toFixed(3)),
+        under25: Number(under.toFixed(3)),
+        top_scores: top5,
+        score_matrix: grid.map(r=>r.map(x=>Number(x.toFixed(6))))
+      },
+      explanation: {
+        notes: "V1 MVP. μ ve Off/Def basit normalize; taktik/SoS çarpanları ileride.",
+        flags: { low_lineup_confidence: xiConfidence !== "high", old_snapshot: false, missing_sources: false }
+      },
+      xi_confidence: xiConfidence,
+      provider_predictions: providerPredictions,
+      sources: [
+        `${API_BASE}/fixtures?id=${fixtureId}`,
+        `${API_BASE}/teams/statistics?team=${homeId}&league=${leagueId}&season=${seasonYr}`,
+        `${API_BASE}/teams/statistics?team=${awayId}&league=${leagueId}&season=${seasonYr}`,
+        `${API_BASE}/fixtures/lineups?fixture=${fixtureId}`,
+        `${API_BASE}/injuries?team=${homeId}&season=${seasonYr}`,
+        `${API_BASE}/injuries?team=${awayId}&season=${seasonYr}`,
+        `${API_BASE}/fixtures/headtohead?h2h=${homeId}-${awayId}`,
+        `${API_BASE}/odds?fixture=${fixtureId}`,
+        `${API_BASE}/predictions?fixture=${fixtureId}`
+      ]
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || "Internal error" });
+  }
+}
