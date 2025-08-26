@@ -1,6 +1,6 @@
-// api/predict.js  —  V1.5.6
-// New: Totals (Over/Under 2.5) market calibration for lambdas + softer DC low-score bias
-// Fix: EFL Cup (Carabao) detected as "cup" mode
+// api/predict.js  —  V1.5.7
+// New: Two-leg detection (UEFA/cup) + 2nd-leg context (first-leg score, aggregate, mild chase multipliers)
+// Keep: Totals (O/U2.5) market calibration for lambdas, softer DC bias, EFL Cup "cup" mode fix
 // Keep: player names (lineup + cross-competition /players fallback), provider percent (string & numeric),
 // strict 1X2 odds, wide μ, XI Off/Def, H2H low-score boost, odds blend, λ cap, referee & tempo,
 // active-injury filter with dedupe, bench-aware lineup.
@@ -40,9 +40,9 @@ function poissonP(k, lambda){ return Math.exp(-lambda) * Math.pow(lambda, k) / f
 function scoreMatrix(lambdaH, lambdaA) {
   const SIZE=7; const m=Array.from({length:SIZE},()=>Array(SIZE).fill(0));
   for (let h=0; h<SIZE; h++) for (let a=0; a<SIZE; a++) m[h][a]=poissonP(h,lambdaH)*poissonP(a,lambdaA);
-  // Softer Dixon–Coles: düşük toplam λ'da hafif, değilse kapalı
+  // Softer Dixon–Coles on low totals
   const tot = lambdaH + lambdaA;
-  const dc = tot <= 2.2 ? 1.02 : 1.00; // önce 1.06 idi → aşırı "under" eğilimini azalt
+  const dc = tot <= 2.2 ? 1.02 : 1.00;
   m[0][0]*=dc; m[1][0]*=dc; m[0][1]*=dc; m[1][1]*=dc;
   const s=m.flat().reduce((x,y)=>x+y,0); for (let h=0; h<SIZE; h++) for (let a=0; a<SIZE; a++) m[h][a]/=s;
   return m;
@@ -276,7 +276,6 @@ function oddsImpliedTotals(oddsResp) {
       for (const bet of (bm.bets || [])) {
         const nm = (bet.name || "").toLowerCase();
         if (!ALLOW.test(nm)) continue;
-        // collect over/under odds for 2.5
         let overOdd = null, underOdd = null;
         for (const v of (bet.values || [])) {
           const odd = Number(v.odd);
@@ -358,7 +357,7 @@ function detectModeFromFixture(fx) {
   if (isUEFA) return "uefa";
   if (isNational) return "national";
 
-  // Geniş "cup" adı yakalama (World/continental kupaları hariç)
+  // Geniş "cup" adı yakalama
   const cupName = /\b(fa cup|efl cup|carabao|league cup|dfb pokal|copa del rey|coppa italia|coupe de france|knvb beker|dutch cup|taca|taça|pokal|beker|scottish cup|copa do brasil|turkish cup|türkiye kupas[ıi])\b/i;
   if (type === "cup" || cupName.test(name)) return "cup";
 
@@ -613,7 +612,6 @@ async function teamPlayersData(teamId, leagueId, season) {
   if (primary.length < 8) {
     try {
       const cross = await afGetAll("/players", { team: teamId, season });
-      // merge by player.id
       const seen = new Set(primary.map(r => r?.player?.id));
       merged = primary.concat(cross.filter(r => !seen.has(r?.player?.id)));
     } catch(_) {}
@@ -641,6 +639,75 @@ function pickLite(ids, ratingsMap, namesMap) {
     if (r) return { id, name: r.name || name || null, grp: r.pos, off: Math.round(r.off), def: Math.round(r.def) };
     return { id, name: name || null };
   });
+}
+
+/* --------- Two-leg helper --------- */
+function findTwoLegInfo(currentFx, h2hResp){
+  try{
+    const leagueId = currentFx?.league?.id;
+    const season   = currentFx?.league?.season;
+    const homeId   = currentFx?.teams?.home?.id;
+    const awayId   = currentFx?.teams?.away?.id;
+    const nowTs    = Date.parse(currentFx?.fixture?.date || "") || 0;
+    const rows = (h2hResp?.response || []).filter(x =>
+      x?.league?.id === leagueId &&
+      x?.league?.season === season &&
+      Date.parse(x?.fixture?.date || "") < nowTs
+    );
+    if (!rows.length) return { is_two_legged:false };
+
+    let best=null, bestRank=-1;
+    for (const g of rows){
+      const ts = Date.parse(g?.fixture?.date || "") || 0;
+      const days = (nowTs - ts) / (24*3600*1000);
+      if (days > 30) continue; // iki ayak için makul pencere
+      const rev = (g?.teams?.home?.id === awayId && g?.teams?.away?.id === homeId) ? 1 : 0;
+      const st  = String(g?.fixture?.status?.short || "").toUpperCase();
+      const ftOK = st === "FT";
+      const rank = (rev ? 100 : 0) + (ftOK ? 10 : 0) - Math.abs(days);
+      if (rank > bestRank) { best = g; bestRank = rank; }
+    }
+    if (!best) return { is_two_legged:false };
+
+    const fl = best;
+    const flHomeId = fl?.teams?.home?.id;
+    const flAwayId = fl?.teams?.away?.id;
+    const flGh = toNum(fl?.goals?.home ?? fl?.score?.fulltime?.home);
+    const flGa = toNum(fl?.goals?.away ?? fl?.score?.fulltime?.away);
+
+    // aggregate BEFORE second leg, mapped to current home/away
+    let aggHomeBefore = 0, aggAwayBefore = 0;
+    if (flHomeId === awayId && flAwayId === homeId) {
+      // first leg at current away's home
+      aggHomeBefore = flGa; // current home was away in 1st leg
+      aggAwayBefore = flGh; // current away was home in 1st leg
+    } else if (flHomeId === homeId && flAwayId === awayId) {
+      // (nadir) same orientation; map directly
+      aggHomeBefore = flGh;
+      aggAwayBefore = flGa;
+    } else {
+      // farklı turnuva/yanlış eşleşme
+      return { is_two_legged:false };
+    }
+
+    const diff = aggHomeBefore - aggAwayBefore; // + => home leads
+    const which_leg = 2;
+
+    return {
+      is_two_legged: true,
+      which_leg,
+      first_leg: {
+        fixture_id: fl?.fixture?.id || null,
+        date: fl?.fixture?.date || null,
+        home_id: flHomeId, away_id: flAwayId,
+        score_home: flGh, score_away: flGa
+      },
+      aggregate_before: { home: aggHomeBefore, away: aggAwayBefore },
+      diff
+    };
+  } catch {
+    return { is_two_legged:false };
+  }
 }
 
 /* ------------------------------ MAIN ------------------------------ */
@@ -730,7 +797,6 @@ export default async function handler(req, res){
     const injIdsHome = new Set(injHomeActive.map(x=>x?.player?.id).filter(Boolean));
     const injIdsAway = new Set(injAwayActive.map(x=>x?.player?.id).filter(Boolean));
 
-    // confirmed_out = ideal XI oyuncusu + maç kadrosunda yok + aktif sakat listesinde
     const squadSetHome = new Set(currentHome);
     const squadSetAway = new Set(currentAway);
     const keyOutHome = idealHome.filter(id => !squadSetHome.has(id) && injIdsHome.has(id));
@@ -763,6 +829,24 @@ export default async function handler(req, res){
     if (xiConfidence === "medium") { lambda_home*=0.97; lambda_away*=0.97; }
     if (xiConfidence === "low")    { lambda_home*=0.94; lambda_away*=0.94; }
 
+    // Two-leg context (2nd leg chase multipliers)
+    const tie = findTwoLegInfo(fixture, h2hJs);
+    let M_leg_home = 1.0, M_leg_away = 1.0;
+    if (tie.is_two_legged && tie.which_leg === 2) {
+      const d = tie.diff; // + => home leads before 2nd leg
+      if (d > 0) { // away trails
+        const boost = d >= 2 ? 1.08 : 1.05;
+        M_leg_away *= boost;
+        M_leg_home *= (d >= 1 ? 0.98 : 1.0);
+      } else if (d < 0) { // home trails
+        const boost = Math.abs(d) >= 2 ? 1.08 : 1.05;
+        M_leg_home *= boost;
+        M_leg_away *= (Math.abs(d) >= 1 ? 0.98 : 1.0);
+      } else { // aggregate level
+        M_leg_home *= 1.01; M_leg_away *= 1.01;
+      }
+    }
+
     // Referee & tempo
     const [refFx, tempoH, tempoA] = await Promise.all([
       refereeFactors(fixture),
@@ -774,11 +858,11 @@ export default async function handler(req, res){
     const M_tempo_home = tempoH?.tempo_mult ?? 1.0;
     const M_tempo_away = tempoA?.tempo_mult ?? 1.0;
 
-    let M_mode_home = 1.0, M_mode_away = 1.0; // hooks for future UEFA/cup specifics
-    lambda_home *= M_ref * M_tempo_home * M_mode_home;
-    lambda_away *= M_ref * M_tempo_away * M_mode_away;
+    let M_mode_home = 1.0, M_mode_away = 1.0; // hooks for future specifics
+    lambda_home *= M_ref * M_tempo_home * M_mode_home * M_leg_home;
+    lambda_away *= M_ref * M_tempo_away * M_mode_away * M_leg_away;
 
-    // ---- Totals market calibration (Over/Under 2.5) ----
+    // Totals market calibration (Over/Under 2.5)
     const totalsMarket = oddsImpliedTotals(oddsJs);
     if (totalsMarket?.over25) {
       const cal = calibrateTotals(lambda_home, lambda_away, totalsMarket.over25);
@@ -809,7 +893,7 @@ export default async function handler(req, res){
     };
     const win_blended = blend(win, market);
 
-    // -------- Provider predictions (robust + UI-compatible fields) --------
+    // Provider predictions (robust + UI-compatible fields)
     const fmtPct = (x) => `${Math.round((Number(x)||0)*100)}%`;
     let provider = null;
     const r = providerPredJs?.response;
@@ -858,7 +942,7 @@ export default async function handler(req, res){
     }
 
     const out = {
-      version: "fa-api v1.5.6",
+      version: "fa-api v1.5.7",
       asof_utc: asof,
       input: { fixture_id: fixtureId, league_id: leagueId, season: seasonYr, mode },
       mu: { mu_home, mu_away },
@@ -924,12 +1008,13 @@ export default async function handler(req, res){
         },
         referee: refFx,
         tempo: { home: tempoH, away: tempoA },
-        mode_factors: { mode, M_ref, M_tempo_home, M_tempo_away },
+        mode_factors: { mode, M_ref, M_tempo_home, M_tempo_away, M_leg_home, M_leg_away },
+        tie: tie,
         h2h_low_boost_applied: h2hBoost.applied,
         market_implied: oddsImplied(oddsJs)
       },
       explanation: {
-        notes: "V1.5.6 – Over/Under 2.5 pazarına göre λ kalibrasyonu + yumuşatılmış DC düşük-skor bias. Ayrıca EFL Cup 'cup' modu fix. İsimler garanti; provider percent; bench-aware lineup; aktif sakat filtresi; hakem/tempo; geniş μ; H2H boost; odds harmanı; λ cap.",
+        notes: "V1.5.7 – İki ayak tespiti + 2. maç bağlamı (ilk ayak skoru, aggregate, ‘chasing’ takım için hafif atak/tempo ayarı). O/U2.5 pazar kalibrasyonu, yumuşatılmış DC bias, EFL Cup cup modu fix ve önceki tüm iyileştirmeler korunur.",
         flags: { low_lineup_confidence: xiConfidence!=="high", old_snapshot:false, missing_sources:false }
       },
       xi_confidence: xiConfidence,
@@ -950,7 +1035,8 @@ export default async function handler(req, res){
         `${API_BASE}/players?team=${homeId}&league=${leagueId}&season=${seasonYr}`,
         `${API_BASE}/players?team=${awayId}&league=${leagueId}&season=${seasonYr}`,
         `${API_BASE}/players?team=${homeId}&season=${seasonYr}`,
-        `${API_BASE}/players?team=${awayId}&season=${seasonYr}`
+        `${API_BASE}/players?team=${awayId}&season=${seasonYr}`,
+        ...(tie?.first_leg?.fixture_id ? [`${API_BASE}/fixtures?id=${tie.first_leg.fixture_id}`] : [])
       ]
     };
 
