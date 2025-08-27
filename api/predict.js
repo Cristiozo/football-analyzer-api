@@ -1,12 +1,9 @@
-// api/predict.js  —  V1.6.0 (merged on canvas)
-// Additions vs v1.5.7:
-//  - Dynamic alphaByTtk (time-to-kickoff aware market/model blend)
-//  - League-aware DC bias (from μ)
-//  - In-memory caching for μ, referee and tempo lookups (TTL)
-//  - Congestion/Rest factor (days since last match) → mild Off/Def effect
-//  - Set-piece proxy (corners last N) → mild Off boost when edge exists
-//  - Formation multipliers (from lineup formations)
-//  - Keep: Two-leg detection + 2nd-leg context, O/U2.5 calibration, XI Off/Def, referee & tempo, injuries, bench-aware lineup.
+// api/predict.js  —  V1.5.7
+// New: Two-leg detection (UEFA/cup) + 2nd-leg context (first-leg score, aggregate, mild chase multipliers)
+// Keep: Totals (O/U2.5) market calibration for lambdas, softer DC bias, EFL Cup "cup" mode fix
+// Keep: player names (lineup + cross-competition /players fallback), provider percent (string & numeric),
+// strict 1X2 odds, wide μ, XI Off/Def, H2H low-score boost, odds blend, λ cap, referee & tempo,
+// active-injury filter with dedupe, bench-aware lineup.
 
 const API_BASE = "https://v3.football.api-sports.io";
 const KEY = process.env.APIFOOTBALL_KEY;
@@ -40,115 +37,43 @@ async function afGetAll(path, params = {}) {
 function clamp(x, lo, hi) { return Math.max(lo, Math.min(hi, x)); }
 function factorial(n){ let f=1; for(let i=2;i<=n;i++) f*=i; return f; }
 function poissonP(k, lambda){ return Math.exp(-lambda) * Math.pow(lambda, k) / factorial(k); }
-function scoreMatrix(lambdaH, lambdaA, dcLow=1.0) {
+function scoreMatrix(lambdaH, lambdaA) {
   const SIZE=7; const m=Array.from({length:SIZE},()=>Array(SIZE).fill(0));
   for (let h=0; h<SIZE; h++) for (let a=0; a<SIZE; a++) m[h][a]=poissonP(h,lambdaH)*poissonP(a,lambdaA);
+  // Softer Dixon–Coles on low totals
   const tot = lambdaH + lambdaA;
-  const dc = tot <= 2.2 ? dcLow : 1.00; // league-aware external param
+  const dc = tot <= 2.2 ? 1.02 : 1.00;
   m[0][0]*=dc; m[1][0]*=dc; m[0][1]*=dc; m[1][1]*=dc;
   const s=m.flat().reduce((x,y)=>x+y,0); for (let h=0; h<SIZE; h++) for (let a=0; a<SIZE; a++) m[h][a]/=s;
   return m;
 }
-function sum1X2(m){ let H=0,D=0,A=0; for(let h=0;h<m.length;h++) for(let a=0;a<m[h].length;a++){ if(h>a) H+=m[h][a]; else if(h===a) D+=m[h][a]; else A+=m[h][a]; } return { home:H, draw:D, away:A }; }
+function sum1X2(m){
+  let H=0,D=0,A=0;
+  for(let h=0;h<m.length;h++) for(let a=0;a<m[h].length;a++){
+    if(h>a) H+=m[h][a]; else if(h===a) D+=m[h][a]; else A+=m[h][a];
+  }
+  return { home:H, draw:D, away:A };
+}
 function bttsYes(m){ let p=0; for(let h=1;h<m.length;h++) for(let a=1;a<m[h].length;a++) p+=m[h][a]; return p; }
 function over25(m){ let p=0; for(let h=0;h<m.length;h++) for(let a=0;a<m[h].length;a++) if(h+a>=3) p+=m[h][a]; return p; }
-function topScores(m, k=5) { const list = []; for(let h=0;h<m.length;h++) for(let a=0;a<m[h].length;a++) list.push({score:`${h}-${a}`, prob:m[h][a]}); list.sort((x,y)=>y.prob-x.prob); return list.slice(0,k).map(s=>({ score:s.score, prob:Number(s.prob.toFixed(3)) })); }
-
-/* ------------------------------ v1.6 additions ------------------------------ */
-/* Simple in-memory caches */
-const _cache = { mu: new Map(), tempo: new Map(), referee: new Map() };
-const TTL = {
-  mu: Number(process.env.CACHE_TTL_MU_MS || 6*3600*1000),
-  tempo: Number(process.env.CACHE_TTL_TEMPO_MS || 6*3600*1000),
-  referee: Number(process.env.CACHE_TTL_REF_MS || 24*3600*1000),
-};
-function __cacheGet(bucket, key){ const rec = _cache[bucket]?.get(key); if (!rec) return null; if (Date.now()>rec.expires){ _cache[bucket].delete(key); return null; } return rec.value; }
-function __cacheSet(bucket, key, value, ttl){ _cache[bucket].set(key, { value, expires: Date.now() + (ttl||3600000) }); }
-
-/* Formation profile multipliers */
-function formationMultipliers(form){
-  const s = String(form||"").trim();
-  let M_off = 1.00, M_def = 1.00, profile = "balanced";
-  if (/^(5-4-1|5-3-2|4-5-1)$/i.test(s)) { M_off = 0.985; M_def = 1.02; profile = "defensive"; }
-  else if (/^(4-3-3|3-4-3|4-2-3-1)$/i.test(s)) { M_off = 1.02; M_def = 0.995; profile = "attacking"; }
-  else if (/^(3-5-2)$/i.test(s)) { M_off = 1.015; M_def = 0.995; profile = "attacking"; }
-  else if (/^(4-4-2)$/i.test(s)) { M_off = 1.00; M_def = 1.00; profile = "balanced"; }
-  return { formation:s||null, profile, M_off:Number(M_off.toFixed(3)), M_def:Number(M_def.toFixed(3)) };
+function topScores(m, k=5) {
+  const list = [];
+  for(let h=0;h<m.length;h++) for(let a=0;a<m[h].length;a++) list.push({score:`${h}-${a}`, prob:m[h][a]});
+  list.sort((x,y)=>y.prob-x.prob);
+  return list.slice(0,k).map(s=>({ score:s.score, prob:Number(s.prob.toFixed(3)) }));
 }
-
-/* Rest/congestion factor */
-async function restFactor(teamId, kickoffISO){
-  try{
-    const fx = await afGetAll('/fixtures', { team: teamId, last: 3 });
-    let lastFT=null;
-    for (const g of fx){ const st=(g?.fixture?.status?.short||'').toUpperCase(); if (st==='FT'){ const d=g?.fixture?.date; if (d) lastFT = Math.max(lastFT||0, Date.parse(d)); } }
-    if (!lastFT) return { days:null, mult:1.0 };
-    const days = (Date.parse(kickoffISO) - lastFT) / (24*3600*1000);
-    let mult = 1.0;
-    if (days <= 2) mult = 0.96;
-    else if (days <= 3) mult = 0.98;
-    else if (days >= 7 && days <= 10) mult = 1.01;
-    return { days:Number(days.toFixed(1)), mult:Number(mult.toFixed(3)) };
-  } catch { return { days:null, mult:1.0 }; }
-}
-
-/* Set-piece proxy via corners */
-async function teamSetPieceIndex(teamId){
-  try{
-    const last = await afGetAll('/fixtures', { team: teamId, last: 10 });
-    let m=0, corners=0;
-    for (const g of last){
-      const st=(g?.fixture?.status?.short||'').toUpperCase(); if (st!=='FT') continue;
-      const fid=g?.fixture?.id; if(!fid) continue;
-      try{
-        const stx = await afGet('/fixtures/statistics', { fixture: fid });
-        for (const row of (stx?.response||[])){
-          if (row?.team?.id !== teamId) continue;
-          const arr=row?.statistics||[];
-          const c = getStatValue(arr, ['corners']);
-          corners += c; m++;
-        }
-      } catch(_){})
-    }
-    if (m===0) return { has:false, corners_avg:0 };
-    return { has:true, corners_avg: Number((corners/m).toFixed(2)) };
-  } catch { return { has:false, corners_avg:0 }; }
-}
-function setPieceMultipliers(idxHome, idxAway){
-  if (!idxHome?.has || !idxAway?.has) return { M_sp_home:1.0, M_sp_away:1.0 };
-  const diff = (idxHome.corners_avg - idxAway.corners_avg);
-  const mag  = Math.abs(diff);
-  const boost = clamp(1 + mag*0.015, 0.96, 1.04);
-  return {
-    M_sp_home: Number((diff > 0 ? boost : 1.0).toFixed(3)),
-    M_sp_away: Number((diff < 0 ? boost : 1.0).toFixed(3))
-  };
-}
-
-/* Market blend alpha by minutes-to-kickoff */
-function alphaByTtk(mins){
-  if (!(mins>=0)) return 0.75;
-  if (mins <= 20) return 0.55;
-  if (mins <= 60) return 0.65;
-  if (mins <= 180) return 0.70;
-  if (mins <= 720) return 0.73;
-  return 0.75;
-}
-
-/* League-aware DC low-total factor from μ */
-function dcFactorFromMu(muH, muA){
-  const tot = (Number(muH)||1.5) + (Number(muA)||1.3);
-  if (tot < 2.5) return 1.03;
-  if (tot < 2.8) return 1.02;
-  if (tot > 3.2) return 0.995;
-  return 1.00;
-}
-/* ---------------------------- end v1.6 add ---------------------------- */
 
 /* --------------------------- domain helpers --------------------------- */
 const toNum = (x)=> x==null ? 0 : Number(x) || 0;
 const per90 = (val, minutes)=> minutes>0 ? (toNum(val)*90)/minutes : 0;
-const posGroup = (p)=> { const s = (p||"").toUpperCase(); if (s.startsWith("G")) return "GK"; if (s.startsWith("D")) return "DEF"; if (s.startsWith("M")) return "MID"; if (s.startsWith("F") || s.includes("W")) return "FWD"; return "MID"; };
+const posGroup = (p)=> {
+  const s = (p||"").toUpperCase();
+  if (s.startsWith("G")) return "GK";
+  if (s.startsWith("D")) return "DEF";
+  if (s.startsWith("M")) return "MID";
+  if (s.startsWith("F") || s.includes("W")) return "FWD";
+  return "MID";
+};
 
 // oyuncu rating
 function ratePlayer(stat) {
@@ -513,7 +438,6 @@ async function scanRefGloballyByLastname(lastname){
 }
 
 async function refereeFactors(fixture) {
-  const __ck = String(fixture?.fixture?.referee||""); const hit = __cacheGet('referee', __ck); if (hit) return hit;
   const refRaw = fixture?.fixture?.referee;
   const clean = sanitizeRefName(refRaw);
   const variants = nameVariants(clean);
@@ -562,32 +486,27 @@ async function refereeFactors(fixture) {
     } catch(_) {}
   }
 
-  let val;
-  if (n === 0) val = { has:false, name:refRaw || null, matches:0, yc:0, rc:0, fouls:0, tempo_mult:1.0 };
-  else {
-    const ycPer = yc / n, rcPer = rc / n, foulsPer = fouls / n;
-    let tempo = 1.0;
-    if (ycPer > 4.5) tempo -= 0.02;
-    if (ycPer > 5.5) tempo -= 0.01;
-    if (foulsPer > 26) tempo -= 0.02;
-    tempo = clamp(tempo, 0.92, 1.02);
+  if (n === 0) return { has:false, name:refRaw || null, matches:0, yc:0, rc:0, fouls:0, tempo_mult:1.0 };
 
-    val = {
-      has:true,
-      name:refRaw || null,
-      matches:n,
-      yc:Number(ycPer.toFixed(2)),
-      rc:Number(rcPer.toFixed(2)),
-      fouls:Number(foulsPer.toFixed(1)),
-      tempo_mult:Number(tempo.toFixed(3))
-    };
-  }
-  __cacheSet('referee', __ck, val, TTL.referee);
-  return val;
+  const ycPer = yc / n, rcPer = rc / n, foulsPer = fouls / n;
+  let tempo = 1.0;
+  if (ycPer > 4.5) tempo -= 0.02;
+  if (ycPer > 5.5) tempo -= 0.01;
+  if (foulsPer > 26) tempo -= 0.02;
+  tempo = clamp(tempo, 0.92, 1.02);
+
+  return {
+    has:true,
+    name:refRaw || null,
+    matches:n,
+    yc:Number(ycPer.toFixed(2)),
+    rc:Number(rcPer.toFixed(2)),
+    fouls:Number(foulsPer.toFixed(1)),
+    tempo_mult:Number(tempo.toFixed(3))
+  };
 }
 
 async function teamTempoIndex(teamId) {
-  const __ck = String(teamId); const hit = __cacheGet('tempo', __ck); if (hit) return hit;
   const last = await afGetAll("/fixtures", { team: teamId, last: 10 });
   let m=0;
   let shotsSum=0, attacksSum=0, dangSum=0, possSum=0;
@@ -630,45 +549,40 @@ async function teamTempoIndex(teamId) {
     } catch(_) {}
   }
 
-  let val;
-  if (m===0) val = { has:false, tempo_mult:1.0, meta:null };
-  else {
-    const shotsAvg   = shotsSum / m;
-    const attacksAvg = attacksSum / m;
-    const dangAvg    = dangSum / m;
-    const possAvg    = possSum / m;
+  if (m===0) return { has:false, tempo_mult:1.0, meta:null };
 
-    let tempo = 1.0;
-    if (shotsAvg > 28) tempo += 0.03;
-    if (shotsAvg < 18) tempo -= 0.02;
-    if (attacksAvg > 200) tempo += 0.02;
-    if (attacksAvg < 140) tempo -= 0.01;
-    if (dangAvg > 120) tempo += 0.02;
-    if (dangAvg < 75)  tempo -= 0.01;
-    if (possAvg > 56) tempo += 0.005;
-    if (possAvg < 44) tempo -= 0.005;
+  const shotsAvg   = shotsSum / m;
+  const attacksAvg = attacksSum / m;
+  const dangAvg    = dangSum / m;
+  const possAvg    = possSum / m;
 
-    tempo = clamp(tempo, 0.94, 1.06);
+  let tempo = 1.0;
+  if (shotsAvg > 28) tempo += 0.03;
+  if (shotsAvg < 18) tempo -= 0.02;
+  if (attacksAvg > 200) tempo += 0.02;
+  if (attacksAvg < 140) tempo -= 0.01;
+  if (dangAvg > 120) tempo += 0.02;
+  if (dangAvg < 75)  tempo -= 0.01;
+  if (possAvg > 56) tempo += 0.005;
+  if (possAvg < 44) tempo -= 0.005;
 
-    val = {
-      has:true,
-      tempo_mult:Number(tempo.toFixed(3)),
-      meta:{
-        matches:m,
-        shotsAvg:Number(shotsAvg.toFixed(1)),
-        attacksAvg:Number(attacksAvg.toFixed(0)),
-        dangAvg:Number(dangAvg.toFixed(0)),
-        possAvg:Number(possAvg.toFixed(1))
-      }
-    };
-  }
-  __cacheSet('tempo', __ck, val, TTL.tempo);
-  return val;
+  tempo = clamp(tempo, 0.94, 1.06);
+
+  return {
+    has:true,
+    tempo_mult:Number(tempo.toFixed(3)),
+    meta:{
+      matches:m,
+      shotsAvg:Number(shotsAvg.toFixed(1)),
+      attacksAvg:Number(attacksAvg.toFixed(0)),
+      dangAvg:Number(dangAvg.toFixed(0)),
+      possAvg:Number(possAvg.toFixed(1))
+    }
+  };
 }
 
 /* --------- League μ (wider seasonal window) --------- */
 async function computeLeagueMu(leagueId, season) {
-  const __ck = `${leagueId}:${season}`; const hit = __cacheGet('mu', __ck); if (hit) return hit;
   const from = `${season-1}-07-01`;
   const to = `${season+1}-06-30`;
   const nowISO = new Date().toISOString();
@@ -683,15 +597,10 @@ async function computeLeagueMu(leagueId, season) {
     const ga = f?.goals?.away ?? f?.score?.fulltime?.away ?? 0;
     homeGoals += toNum(gh); awayGoals += toNum(ga); n++;
   }
-  let val;
-  if (n===0) val = { mu_home:1.60, mu_away:1.20 };
-  else {
-    const muH = homeGoals/n;
-    const muA = awayGoals/n;
-    val = { mu_home: Number(muH.toFixed(2)), mu_away: Number(muA.toFixed(2)) };
-  }
-  __cacheSet('mu', __ck, val, TTL.mu);
-  return val;
+  if (n===0) return { mu_home:1.60, mu_away:1.20 };
+  const muH = homeGoals/n;
+  const muA = awayGoals/n;
+  return { mu_home: Number(muH.toFixed(2)), mu_away: Number(muA.toFixed(2)) };
 }
 
 /* --------- Players (ratings + names) --------- */
@@ -822,7 +731,6 @@ export default async function handler(req, res){
     if(!kickoffISO) throw new Error("Kickoff time missing");
     const now = Date.now();
     const kickoff = new Date(kickoffISO).getTime();
-    const minsToKick = Math.max(0, Math.round((kickoff - now)/60000));
 
     const mode = detectModeFromFixture(fixture);
 
@@ -921,19 +829,11 @@ export default async function handler(req, res){
     if (xiConfidence === "medium") { lambda_home*=0.97; lambda_away*=0.97; }
     if (xiConfidence === "low")    { lambda_home*=0.94; lambda_away*=0.94; }
 
-    // Formation/tactical multipliers
-    const formHome = (luHome?.formation || "").trim();
-    const formAway = (luAway?.formation || "").trim();
-    const fHome = formationMultipliers(formHome);
-    const fAway = formationMultipliers(formAway);
-    lambda_home *= (fHome.M_off / (fAway.M_def || 1.0));
-    lambda_away *= (fAway.M_off / (fHome.M_def || 1.0));
-
     // Two-leg context (2nd leg chase multipliers)
     const tie = findTwoLegInfo(fixture, h2hJs);
     let M_leg_home = 1.0, M_leg_away = 1.0;
     if (tie.is_two_legged && tie.which_leg === 2) {
-      const d = tie.diff; // + => home leads
+      const d = tie.diff; // + => home leads before 2nd leg
       if (d > 0) { // away trails
         const boost = d >= 2 ? 1.08 : 1.05;
         M_leg_away *= boost;
@@ -954,29 +854,13 @@ export default async function handler(req, res){
       teamTempoIndex(awayId),
     ]);
 
-    // Rest & Set-piece
-    const [restH, restA] = await Promise.all([
-      restFactor(homeId, kickoffISO),
-      restFactor(awayId, kickoffISO)
-    ]);
-    const [spH, spA] = await Promise.all([
-      teamSetPieceIndex(homeId),
-      teamSetPieceIndex(awayId)
-    ]);
-
-    const spMult = setPieceMultipliers(spH, spA);
-
     const M_ref = refFx?.tempo_mult ?? 1.0;
     const M_tempo_home = tempoH?.tempo_mult ?? 1.0;
     const M_tempo_away = tempoA?.tempo_mult ?? 1.0;
-    const M_rest_home = restH?.mult ?? 1.0;
-    const M_rest_away = restA?.mult ?? 1.0;
-    const M_sp_home = spMult.M_sp_home;
-    const M_sp_away = spMult.M_sp_away;
 
     let M_mode_home = 1.0, M_mode_away = 1.0; // hooks for future specifics
-    lambda_home *= M_ref * M_tempo_home * M_mode_home * M_leg_home * M_rest_home * M_sp_home;
-    lambda_away *= M_ref * M_tempo_away * M_mode_away * M_leg_away * M_rest_away * M_sp_away;
+    lambda_home *= M_ref * M_tempo_home * M_mode_home * M_leg_home;
+    lambda_away *= M_ref * M_tempo_away * M_mode_away * M_leg_away;
 
     // Totals market calibration (Over/Under 2.5)
     const totalsMarket = oddsImpliedTotals(oddsJs);
@@ -989,8 +873,7 @@ export default async function handler(req, res){
       lambda_away = clamp(lambda_away, 0.2, 3.8);
     }
 
-    const dcLow = dcFactorFromMu(mu_home, mu_away);
-    let grid = scoreMatrix(lambda_home, lambda_away, dcLow);
+    let grid = scoreMatrix(lambda_home, lambda_away);
     const h2hBoost = applyLowScoreBoost(grid, h2hJs);
     grid = h2hBoost.matrix;
 
@@ -1000,7 +883,6 @@ export default async function handler(req, res){
     const under = 1 - over;
 
     const market = oddsImplied(oddsJs);
-    const alpha = alphaByTtk(minsToKick);
     const blend = (m,b,alpha=0.75)=> {
       if (!b) return m;
       return {
@@ -1009,7 +891,7 @@ export default async function handler(req, res){
         away: clamp(alpha*m.away + (1-alpha)*b.away, 0, 1)
       };
     };
-    const win_blended = blend(win, market, alpha);
+    const win_blended = blend(win, market);
 
     // Provider predictions (robust + UI-compatible fields)
     const fmtPct = (x) => `${Math.round((Number(x)||0)*100)}%`;
@@ -1060,7 +942,7 @@ export default async function handler(req, res){
     }
 
     const out = {
-      version: "fa-api v1.6.0",
+      version: "fa-api v1.5.7",
       asof_utc: asof,
       input: { fixture_id: fixtureId, league_id: leagueId, season: seasonYr, mode },
       mu: { mu_home, mu_away },
@@ -1126,13 +1008,13 @@ export default async function handler(req, res){
         },
         referee: refFx,
         tempo: { home: tempoH, away: tempoA },
-        mode_factors: { mode, M_ref, M_tempo_home, M_tempo_away, M_leg_home, M_leg_away, M_rest_home, M_rest_away, M_sp_home, M_sp_away },
+        mode_factors: { mode, M_ref, M_tempo_home, M_tempo_away, M_leg_home, M_leg_away },
         tie: tie,
         h2h_low_boost_applied: h2hBoost.applied,
         market_implied: oddsImplied(oddsJs)
       },
       explanation: {
-        notes: "V1.6.0 – TTK’ye göre market blend, μ’ye göre DC low tweak, μ/tempo/referee caching, dinlenme ve duran top proxy’leri, formation çarpanları. O/U2.5 pazar kalibrasyonu ve iki maçlı eşleşme bağlamı korunur.",
+        notes: "V1.5.7 – İki ayak tespiti + 2. maç bağlamı (ilk ayak skoru, aggregate, ‘chasing’ takım için hafif atak/tempo ayarı). O/U2.5 pazar kalibrasyonu, yumuşatılmış DC bias, EFL Cup cup modu fix ve önceki tüm iyileştirmeler korunur.",
         flags: { low_lineup_confidence: xiConfidence!=="high", old_snapshot:false, missing_sources:false }
       },
       xi_confidence: xiConfidence,
@@ -1162,7 +1044,6 @@ export default async function handler(req, res){
       out.modifiers._debug = {
         INJ_ACTIVE_WINDOW_DAYS,
         INJ_INCLUDE_DOUBTFUL,
-        alphaByTtk: alpha,
         provider_raw_excerpt: JSON.stringify((providerPredJs?.response||[])[0] ?? null).slice(0,1200)
       };
     }
